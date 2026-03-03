@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 from typing import Dict, List, Optional, Tuple, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 import time
 
@@ -19,12 +19,12 @@ from .refinement import GeometryRefiner, RefinementConfig
 class PipelineConfig:
     """Complete pipeline configuration."""
     # Model configs
-    lm_config: LMConfig = LMConfig()
-    ss_config: SSConfig = SSConfig()
-    encoder_config: EncoderConfig = EncoderConfig()
-    geometry_config: GeometryConfig = GeometryConfig()
-    sampler_config: SamplerConfig = SamplerConfig()
-    refinement_config: RefinementConfig = RefinementConfig()
+    lm_config: LMConfig = field(default_factory=LMConfig)
+    ss_config: SSConfig = field(default_factory=SSConfig)
+    encoder_config: EncoderConfig = field(default_factory=EncoderConfig)
+    geometry_config: GeometryConfig = field(default_factory=GeometryConfig)
+    sampler_config: SamplerConfig = field(default_factory=SamplerConfig)
+    refinement_config: RefinementConfig = field(default_factory=RefinementConfig)
     
     # Pipeline settings
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

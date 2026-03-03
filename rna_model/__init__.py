@@ -6,7 +6,7 @@ from .structure_encoder import StructureEncoder
 from .geometry_module import GeometryModule
 from .sampler import RNASampler
 from .refinement import GeometryRefiner
-from .pipeline import RNAFoldingPipeline
+from .pipeline import RNAFoldingPipeline, PipelineConfig, IntegratedModel
 
 __version__ = "0.1.0"
 __all__ = [
@@ -17,4 +17,6 @@ __all__ = [
     "RNASampler",
     "GeometryRefiner",
     "RNAFoldingPipeline",
+    "PipelineConfig",
+    "IntegratedModel",
 ]
