@@ -10,9 +10,9 @@ import math
 import random
 import time
 
-from .utils import compute_contact_map, compute_rmsd
+from .utils import compute_contact_map
 from .geometry_module import RigidTransform
-from .logging_config import setup_logger
+from .logging_config import setup_logging
 
 
 @dataclass
@@ -51,7 +51,7 @@ class RNASampler(nn.Module):
         
         self.config = config
         self.rigid_transform = RigidTransform()
-        self.logger = setup_logger("rna_sampler")
+        self.logger = setup_logging("rna_sampler")
         
         # Set random seed for reproducibility
         torch.manual_seed(42)
@@ -184,6 +184,11 @@ class RNASampler(nn.Module):
             
             # Compute confidence score (pass cached computations to avoid redundancy)
             confidence_start = time.time()
+            # Compute distances and contact map for confidence calculation
+            rep_coords = coords[:, :, 0, :]  # (batch_size, seq_len, 3)
+            diff = rep_coords.unsqueeze(2) - rep_coords.unsqueeze(1)  # (batch_size, seq_len, seq_len, 3)
+            distances = torch.norm(diff, dim=-1)  # (batch_size, seq_len, seq_len)
+            contact_tensor = (distances < self.config.contact_threshold).float()  # (batch_size, seq_len, seq_len)
             confidence = self._compute_confidence(sequence, coords, distances, contact_tensor)
             confidence_time += time.time() - confidence_start
             
@@ -252,8 +257,9 @@ class RNASampler(nn.Module):
                 motif_coords = motif.unsqueeze(0).expand(batch_size, -1, -1, -1)
                 coords[:, start_pos:end_pos] = motif_coords[:, :end_pos-start_pos]
                 
-                # Clean up motif tensors
+                # Clean up motif tensors immediately
                 del motif_coords
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
             
             # Apply small random rotations
             if random.random() < 0.5:
@@ -273,12 +279,21 @@ class RNASampler(nn.Module):
                 
                 # Clean up if memory usage is high (>80%) or every 100 steps
                 if memory_utilization > 0.8 or step % 100 == 0:
+                    # Force garbage collection before cache cleanup
+                    import gc
+                    gc.collect()
                     torch.cuda.empty_cache()
                     if step % 100 == 0:  # Log cleanup every 100 steps
                         self.logger.debug(f"GPU cache cleanup at step {step}, memory usage: {memory_utilization:.2%}")
             
             # Calculate current energy (simple approximation)
             current_energy = self._calculate_energy(coords, sequence)
+            
+            # Initialize best_energy and best_coords on first iteration
+            if step == 0:
+                best_energy = current_energy
+                best_coords = coords.clone()
+                patience_counter = 0
             
             # Check for improvement
             if current_energy < best_energy - self.config.convergence_threshold:
@@ -447,20 +462,22 @@ class RNASampler(nn.Module):
             rep_coords = coords[:, :, 0, :]  # (batch_size, seq_len, 3)
             diff = rep_coords.unsqueeze(2) - rep_coords.unsqueeze(1)  # (batch_size, seq_len, seq_len, 3)
             distances = torch.norm(diff, dim=-1)  # (batch_size, seq_len, seq_len)
-            contact_map = (distances < self.config.contact_threshold).float()  # (batch_size, seq_len, seq_len)
             
-            # Set diagonal to 0
-            batch_indices = torch.arange(seq_len, device=coords.device)
-            contact_map[:, batch_indices, batch_indices] = 0.0
+        # Set diagonal to 0
+        batch_indices = torch.arange(seq_len, device=coords.device)
+        contact_map[:, batch_indices, batch_indices] = 0.0
             
-            # Clean up computation tensors
-            del rep_coords, diff, batch_indices
+        # Clean up computation tensors
+        del rep_coords, diff, batch_indices
+        # Additional cleanup for large tensors
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # Compute RMSD-like metric
         total_contacts = torch.sum(contact_map)
         max_contacts = seq_len * (seq_len - 1) / 2  # Maximum possible contacts
         contact_ratio = total_contacts / max_contacts if max_contacts > 0 else 0
-        
+            
         # Base confidence on contact ratio
         confidence = 0.3 + 0.7 * contact_ratio
         

@@ -5,6 +5,7 @@
 import torch
 import torch.nn as nn
 from pathlib import Path
+from typing import Dict, List, Any, Optional
 
 from .language_model import RNALanguageModel
 from .secondary_structure import SecondaryStructurePredictor
@@ -13,7 +14,7 @@ from .geometry_module import GeometryModule
 from .sampler import RNASampler, SamplerConfig
 from .refinement import GeometryRefiner
 from .config import GlobalConfig, get_config, validate_config
-from .logging_config import setup_logger, StructuredLogger
+from .logging_config import setup_logging, StructuredLogger
 from .data import RNADatasetLoader, RNAStructure
 from .training import Trainer, TrainingConfig
 from .evaluation import StructureEvaluator, EvaluationMetrics
@@ -27,9 +28,9 @@ from .utils import (
 class RNAFoldingPipeline:
     """Main RNA 3D folding pipeline."""
     
-    def __init__(self, config: PipelineConfig) -> None:
+    def __init__(self, config: "PipelineConfig") -> None:
         self.config = config
-        self.logger = setup_logger("rna_folding")
+        self.logger = setup_logging("rna_folding")
         
         # Initialize components
         self.language_model = RNALanguageModel(config.lm_config)
@@ -127,7 +128,7 @@ class RNAFoldingPipeline:
                 "coordinates": refined_decoys[0]["coordinates"] if refined_decoys else None,
                 "confidence": 0.8,  # Default confidence
                 "success": True,
-                "decoys": refined_decoys if return_all_decoys else refined_decocoys[:5]
+                "decoys": refined_decoys if return_all_decoys else refined_decoys[:5]
             }
             
             self.logger.info(f"Successfully predicted structure for {sequence}")
@@ -196,7 +197,8 @@ class RNAFoldingPipeline:
                 batch_tokens = torch.zeros(len(valid_sequences), max_len, dtype=torch.long, device=self.device)
                 
                 for batch_idx, (_, sequence) in enumerate(valid_sequences):
-                    tokens = self._tokenize_sequence(sequence)
+                    token_dict = self._tokenize_sequence(sequence)
+                    tokens = token_dict["tokens"]
                     batch_tokens[batch_idx, :len(tokens)] = tokens
                 
                 # Forward pass for batch
@@ -289,17 +291,42 @@ class RNAFoldingPipeline:
             # Load with weights_only=True for security
             checkpoint = torch.load(model_path, map_location=self.config.device, weights_only=True)
             
+            # Comprehensive checkpoint validation
+            if not isinstance(checkpoint, dict):
+                raise ValueError("Checkpoint must be a dictionary")
+            
             # Validate checkpoint structure
             required_keys = ['language_model', 'secondary_structure', 'structure_encoder', 'geometry_module']
             missing_keys = [key for key in required_keys if key not in checkpoint]
             if missing_keys:
                 raise KeyError(f"Missing required keys in checkpoint: {missing_keys}")
             
+            # Validate each model state dict
+            for model_name in required_keys:
+                state_dict = checkpoint[model_name]
+                if not isinstance(state_dict, dict):
+                    raise ValueError(f"State dict for {model_name} must be a dictionary")
+                
+                # Check for suspicious keys (potential security risk)
+                suspicious_keys = ['__builtins__', '__import__', 'eval', 'exec', 'compile']
+                for key in state_dict.keys():
+                    if any(suspicious in key.lower() for suspicious in suspicious_keys):
+                        raise ValueError(f"Suspicious key found in {model_name} state dict: {key}")
+                
+                # Validate tensor shapes and types
+                for param_name, param_tensor in state_dict.items():
+                    if not isinstance(param_tensor, torch.Tensor):
+                        raise ValueError(f"Parameter {param_name} in {model_name} is not a tensor")
+                    
+                    # Check for reasonable tensor sizes
+                    if param_tensor.numel() > 1e9:  # > 1GB tensor
+                        raise ValueError(f"Parameter {param_name} in {model_name} is too large: {param_tensor.numel()} elements")
+            
             # Load state dictionaries with validation
-            self.language_model.load_state_dict(checkpoint['language_model'])
-            self.secondary_structure.load_state_dict(checkpoint['secondary_structure'])
-            self.structure_encoder.load_state_dict(checkpoint['structure_encoder'])
-            self.geometry_module.load_state_dict(checkpoint['geometry_module'])
+            self.language_model.load_state_dict(checkpoint['language_model'], strict=True)
+            self.secondary_structure.load_state_dict(checkpoint['secondary_structure'], strict=True)
+            self.structure_encoder.load_state_dict(checkpoint['structure_encoder'], strict=True)
+            self.geometry_module.load_state_dict(checkpoint['geometry_module'], strict=True)
             
             # Set models to eval mode for inference
             self.language_model.eval()
@@ -407,7 +434,7 @@ __all__ = [
     "GlobalConfig",
     "get_config",
     "validate_config",
-    "setup_logger",
+    "setup_logging",
     "StructuredLogger",
     "RNADatasetLoader",
     "RNAStructure",

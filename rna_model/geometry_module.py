@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import math
+import logging
 
 
 @dataclass
@@ -448,18 +449,31 @@ def fape_loss(pred_coords: torch.Tensor,
     """Frame-Aligned Point Error (FAPE) loss."""
     batch_size, seq_len, n_atoms, _ = pred_coords.shape
     
-    # Transform coordinates to local frames
-    pred_local = RigidTransform.apply_transform(
-        pred_coords - pred_frames[..., :3, 3].unsqueeze(2),
-        RigidTransform.quaternion_to_matrix(pred_frames).inverse(),
-        torch.zeros_like(pred_frames[..., :3, 3]).unsqueeze(2)
-    )
-    
-    true_local = RigidTransform.apply_transform(
-        true_coords - true_frames[..., :3, 3].unsqueeze(2),
-        RigidTransform.quaternion_to_matrix(true_frames).inverse(),
-        torch.zeros_like(true_frames[..., :3, 3]).unsqueeze(2)
-    )
+    # Transform coordinates to local frames with numerical stability
+    try:
+        pred_rot_matrices = RigidTransform.quaternion_to_matrix(pred_frames)
+        true_rot_matrices = RigidTransform.quaternion_to_matrix(true_frames)
+        
+        # Safe matrix inverse with regularization
+        pred_rot_inv = torch.inverse(pred_rot_matrices + torch.eye(3, device=pred_rot_matrices.device, dtype=pred_rot_matrices.dtype) * 1e-6)
+        true_rot_inv = torch.inverse(true_rot_matrices + torch.eye(3, device=true_rot_matrices.device, dtype=true_rot_matrices.dtype) * 1e-6)
+        
+        pred_local = RigidTransform.apply_transform(
+            pred_coords - pred_frames[..., :3, 3].unsqueeze(2),
+            pred_rot_inv,
+            torch.zeros_like(pred_frames[..., :3, 3]).unsqueeze(2)
+        )
+        
+        true_local = RigidTransform.apply_transform(
+            true_coords - true_frames[..., :3, 3].unsqueeze(2),
+            true_rot_inv,
+            torch.zeros_like(true_frames[..., :3, 3]).unsqueeze(2)
+        )
+    except torch.linalg.LinAlgError as e:
+        # Fallback to identity transformation if matrix inversion fails
+        pred_local = pred_coords
+        true_local = true_coords
+        logging.warning(f"Matrix inversion failed in FAPE loss, using identity: {e}")
     
     # Compute squared errors
     squared_errors = ((pred_local - true_local) ** 2).sum(dim=-1)

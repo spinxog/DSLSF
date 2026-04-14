@@ -35,7 +35,7 @@ def decode_tokens(tokens: torch.Tensor) -> str:
 
 
 def compute_contact_map(coords: np.ndarray, threshold: float = 8.0) -> np.ndarray:
-    """Compute contact map from coordinates.
+    """Compute contact map from coordinates using vectorized operations.
     
     Args:
         coords: Coordinate array of shape (N, 3)
@@ -51,13 +51,17 @@ def compute_contact_map(coords: np.ndarray, threshold: float = 8.0) -> np.ndarra
         raise ValueError(f"Expected 2D coordinates with 3 columns, got shape {coords.shape}")
     
     n_atoms = len(coords)
-    contact_map = np.zeros((n_atoms, n_atoms), dtype=bool)
     
-    for i in range(n_atoms):
-        for j in range(n_atoms):
-            if i != j:
-                distance = np.linalg.norm(coords[i] - coords[j])
-                contact_map[i, j] = distance < threshold
+    # Vectorized distance computation
+    # Compute pairwise differences: (N, 1, 3) - (1, N, 3) -> (N, N, 3)
+    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+    
+    # Compute distances: sqrt(sum(diff^2, axis=2)) -> (N, N)
+    distances = np.sqrt(np.sum(diff**2, axis=2))
+    
+    # Create contact map (exclude diagonal)
+    contact_map = distances < threshold
+    np.fill_diagonal(contact_map, False)
     
     return contact_map
 

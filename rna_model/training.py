@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 from dataclasses import dataclass
 import time
@@ -13,7 +13,7 @@ from pathlib import Path
 from .language_model import RNALanguageModel, masked_span_loss, contact_loss
 from .secondary_structure import SecondaryStructurePredictor, secondary_structure_loss
 from .geometry_module import GeometryModule, geometry_loss, fape_loss
-from .pipeline import IntegratedModel, PipelineConfig
+# Import PipelineConfig locally to avoid circular imports
 from .utils import set_seed, clear_cache, memory_usage
 import json
 
@@ -199,7 +199,7 @@ class Trainer:
     """Trainer for RNA 3D folding pipeline."""
     
     def __init__(self, 
-                 model: IntegratedModel,
+                 model: "IntegratedModel",
                  config: TrainingConfig,
                  device: torch.device = torch.device("cuda")):
         self.model = model
@@ -592,7 +592,7 @@ def create_training_config(overrides: Optional[Dict] = None) -> TrainingConfig:
     return config
 
 
-def train_model(model: IntegratedModel,
+def train_model(model: "IntegratedModel",
                 train_dataset: RNADataset,
                 val_dataset: Optional[RNADataset] = None,
                 config_overrides: Optional[Dict] = None,

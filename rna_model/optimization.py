@@ -12,7 +12,7 @@ import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from .experiment import ExperimentManager, ExperimentConfig, ExperimentResults
-from .training import RNATrainer, TrainingConfig
+from .training import Trainer, TrainingConfig
 from .pipeline import RNAFoldingPipeline, PipelineConfig
 
 
