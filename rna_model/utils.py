@@ -31,6 +31,34 @@ def decode_tokens(tokens: torch.Tensor) -> str:
     return sequence
 
 
+def compute_contact_map(coords: np.ndarray, threshold: float = 8.0) -> np.ndarray:
+    """Compute contact map from coordinates.
+    
+    Args:
+        coords: Coordinate array of shape (N, 3)
+        threshold: Distance threshold for contact definition
+        
+    Returns:
+        Boolean contact map of shape (N, N)
+        
+    Raises:
+        ValueError: If coords is not 2D or has wrong shape
+    """
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError(f"Expected 2D coordinates with 3 columns, got shape {coords.shape}")
+    
+    n_atoms = len(coords)
+    contact_map = np.zeros((n_atoms, n_atoms), dtype=bool)
+    
+    for i in range(n_atoms):
+        for j in range(n_atoms):
+            if i != j:
+                distance = np.linalg.norm(coords[i] - coords[j])
+                contact_map[i, j] = distance < threshold
+    
+    return contact_map
+
+
 def compute_tm_score(coords1: np.ndarray, coords2: np.ndarray) -> float:
     """Compute TM-score between two coordinate sets.
     
@@ -58,7 +86,7 @@ def compute_tm_score(coords1: np.ndarray, coords2: np.ndarray) -> float:
     diff = coords1_centered - coords2_centered
     rmsd = np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
     
-    # Correct TM-score formula with proper handling of short sequences
+    # TM-score formula with proper handling of short sequences
     n = len(coords1)
     if n <= 15:
         d0 = 0.5  # For short sequences (< 15 residues)

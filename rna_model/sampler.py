@@ -3,11 +3,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
 from dataclasses import dataclass
 import numpy as np
 import math
 import random
+import time
 
 from .utils import compute_contact_map, compute_rmsd
 from .geometry_module import RigidTransform
@@ -26,11 +27,25 @@ class SamplerConfig:
     rmsd_threshold: float = 5.0
 
 
+@dataclass
+class PerformanceMetrics:
+    """Performance metrics for sampling operations."""
+    total_time: float
+    constraint_time: float
+    confidence_time: float
+    n_violations: int
+    memory_peak: float
+    n_decoys_generated: int
+
+
 class RNASampler(nn.Module):
     """RNA structure sampler using fragment-based approach."""
     
     def __init__(self, config: SamplerConfig):
         super().__init__()
+        # Validate configuration
+        self._validate_config(config)
+        
         self.config = config
         self.rigid_transform = RigidTransform()
         self.logger = setup_logger("rna_sampler")
@@ -39,6 +54,9 @@ class RNASampler(nn.Module):
         torch.manual_seed(42)
         np.random.seed(42)
         random.seed(42)
+        
+        # Initialize performance tracking
+        self._last_violations = 0
         
         # Fragment library (simplified)
         self.register_buffer('motif_library', self._create_motif_library())
@@ -79,13 +97,39 @@ class RNASampler(nn.Module):
         
         return motifs
     
+    def _validate_config(self, config: SamplerConfig) -> None:
+        """Validate sampler configuration parameters."""
+        if config.n_decoys <= 0 or config.n_decoys > 100:
+            raise ValueError(f"n_decoys must be between 1 and 100, got {config.n_decoys}")
+        
+        if config.temperature <= 0 or config.temperature > 10:
+            raise ValueError(f"temperature must be between 0 and 10, got {config.temperature}")
+        
+        if config.min_distance <= 0 or config.min_distance > 10:
+            raise ValueError(f"min_distance must be between 0 and 10, got {config.min_distance}")
+        
+        if config.max_distance <= config.min_distance:
+            raise ValueError(f"max_distance ({config.max_distance}) must be greater than min_distance ({config.min_distance})")
+        
+        if config.n_steps <= 0 or config.n_steps > 10000:
+            raise ValueError(f"n_steps must be between 1 and 10000, got {config.n_steps}")
+        
+        if config.contact_threshold <= 0 or config.contact_threshold > 50:
+            raise ValueError(f"contact_threshold must be between 0 and 50, got {config.contact_threshold}")
+    
     def generate_decoys(self, sequence: str, embeddings: torch.Tensor, 
                      initial_coords: Optional[torch.Tensor] = None,
-                     return_all_decoys: bool = False) -> List[Dict]:
-        """Generate structure decoys."""
+                     return_all_decoys: bool = False,
+                     progress_callback: Optional[Callable[[int, int], None]] = None) -> Tuple[List[Dict], PerformanceMetrics]:
+        """Generate structure decoys with performance metrics."""
         # Input validation
         if not sequence or not isinstance(sequence, str):
             raise ValueError("Sequence must be a non-empty string")
+        
+        # Start performance tracking
+        start_time = time.time()
+        initial_memory = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0.0
+        total_violations = 0
         
         if embeddings.dim() != 3:
             raise ValueError(f"Expected 3D embeddings tensor, got {embeddings.dim()}D")
@@ -114,24 +158,63 @@ class RNASampler(nn.Module):
                 raise ValueError(f"Expected initial_coords shape {expected_shape}, got {initial_coords.shape}")
         
         decoys = []
+        constraint_time = 0.0
+        confidence_time = 0.0
         
-        for i in range(self.config.n_decoys if not return_all_decoys else 1):
+        n_decoys_to_generate = self.config.n_decoys if not return_all_decoys else 1
+        
+        for i in range(n_decoys_to_generate):
+            if progress_callback is not None:
+                progress_callback(i, n_decoys_to_generate)
+            
             # Sample structure
+            sample_start = time.time()
             coords = self._sample_structure(
                 sequence, embeddings, initial_coords, temperature=self.config.temperature
             )
+            sample_time = time.time() - sample_start
+            
+            # Apply constraints and track violations
+            constraint_start = time.time()
+            coords = self._apply_constraints(coords, sequence)
+            constraint_time += time.time() - constraint_start
             
             # Compute confidence score (pass cached computations to avoid redundancy)
+            confidence_start = time.time()
             confidence = self._compute_confidence(sequence, coords, distances, contact_tensor)
+            confidence_time += time.time() - confidence_start
+            
+            # Count violations (approximate from logging)
+            if hasattr(self, '_last_violations'):
+                total_violations += self._last_violations
             
             decoys.append({
                 "coordinates": coords,
                 "confidence": confidence,
                 "decoy_id": i,
-                "sequence": sequence
+                "sequence": sequence,
+                "sample_time": sample_time,
+                "constraint_time": time.time() - constraint_start,
+                "confidence_time": time.time() - confidence_start
             })
         
-        return decoys
+        # Calculate final metrics
+        total_time = time.time() - start_time
+        final_memory = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0.0
+        memory_peak = max(final_memory - initial_memory, 0.0)
+        
+        metrics = PerformanceMetrics(
+            total_time=total_time,
+            constraint_time=constraint_time,
+            confidence_time=confidence_time,
+            n_violations=total_violations,
+            memory_peak=memory_peak,
+            n_decoys_generated=len(decoys)
+        )
+        
+        self.logger.debug(f"Performance metrics: {metrics}")
+        
+        return decoys, metrics
     
     def _sample_structure(self, sequence: str, embeddings: torch.Tensor,
                         initial_coords: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
@@ -175,11 +258,9 @@ class RNASampler(nn.Module):
                 quat = torch.randn(batch_size, 4)
                 quat = quat / (torch.norm(quat, dim=-1, keepdim=True) + 1e-8)
                 
-                # Apply rotation
-                for j in range(seq_len):
-                    coords[:, j] = self.rigid_transform.apply_transform(
-                        coords[:, j:j+1], quat, torch.zeros(batch_size, 3, device=device)
-                    )
+                # Apply rotation vectorized
+                rotation_matrix = self.rigid_transform.quaternion_to_matrix(quat)
+                coords = torch.bmm(coords.view(-1, 3), rotation_matrix).view(batch_size, seq_len, 3, 3)
                 
                 # Clean up quaternion
                 del quat
@@ -227,7 +308,12 @@ class RNASampler(nn.Module):
             raise ValueError(f"Expected batch size 1, got {batch_size}")
         
         if seq_len != len(sequence):
-            raise ValueError(f"Coordinate sequence length {seq_len} doesn't match sequence length {len(sequence)}")
+            raise ValueError(
+                f"Coordinate sequence length {seq_len} doesn't match sequence length {len(sequence)}.\n"
+                f"This indicates a mismatch between the coordinate tensor shape and the input sequence.\n"
+                f"Expected sequence length: {seq_len}, Got: {len(sequence)}\n"
+                f"Coordinate tensor shape: {coords.shape}, Sequence length: {len(sequence)}"
+            )
         
         if n_atoms < 1:
             raise ValueError(f"Expected at least 1 atom, got {n_atoms}")
@@ -254,6 +340,7 @@ class RNASampler(nn.Module):
             
             if violations.any():
                 self.logger.debug(f"Found {violations.sum().item()} bond violations")
+                self._last_violations = violations.sum().item()  # Track for metrics
                 # Compute directions for violating bonds only
                 bond_directions = bond_vectors / (bond_distances + 1e-8)  # Normalized directions
                 
@@ -265,6 +352,9 @@ class RNASampler(nn.Module):
                             # Apply correction only to violating samples
                             correction = bond_directions[:, i, j] * (min_dist - bond_distances[:, i, j])
                             coords[violation_mask, i, j] = coords[violation_mask, i, j] + correction[violation_mask]
+                
+                # Clean up bond constraint tensors
+                del bond_vectors, bond_distances, violations, bond_directions
         
         # Contact constraints (vectorized computation)
         rep_coords = coords[:, :, 0, :]  # (batch_size, seq_len, 3)
@@ -288,6 +378,7 @@ class RNASampler(nn.Module):
             
             if contact_violations.any():
                 self.logger.debug(f"Found {contact_violations.sum().item()} contact violations")
+                self._last_violations += contact_violations.sum().item()  # Track for metrics
                 # Compute direction vectors only for violations
                 rep_coords_expanded_i = rep_coords.unsqueeze(2)  # (batch_size, seq_len, 1, 3)
                 rep_coords_expanded_j = rep_coords.unsqueeze(1)  # (batch_size, 1, seq_len, 3)
@@ -295,14 +386,19 @@ class RNASampler(nn.Module):
                 direction_vectors = rep_coords_expanded_j - rep_coords_expanded_i  # (batch_size, seq_len, seq_len, 3)
                 direction_vectors = direction_vectors / (distances.unsqueeze(-1) + 1e-8)  # Normalized
                 
-                # Apply corrections vectorized where violations exist
-                for i in range(seq_len):
-                    for j in range(i + 1, seq_len):
-                        violation_mask = contact_violations[:, i, j]
-                        if violation_mask.any():
-                            # Apply correction only to violating samples
-                            correction = direction_vectors[:, i, j] * (min_dist - distances[:, i, j])
-                            coords[violation_mask, j, 0] = coords[violation_mask, i, 0] + correction[violation_mask]
+                # Apply corrections fully vectorized where violations exist
+                if contact_violations.any():
+                    # Get all violation indices at once
+                    violation_indices = torch.nonzero(contact_violations, as_tuple=False)
+                    if len(violation_indices[0]) > 0:
+                        batch_idx, i_idx, j_idx = violation_indices
+                        
+                        # Apply corrections vectorized
+                        corrections = direction_vectors[batch_idx, i_idx, j_idx] * (min_dist - distances[batch_idx, i_idx, j_idx])
+                        coords[batch_idx, j_idx, 0] = coords[batch_idx, i_idx, 0] + corrections
+                
+                # Clean up contact constraint tensors
+                del rep_coords, diff, contact_tensor, contact_violations, direction_vectors, violation_indices
         
         return coords
     
@@ -331,6 +427,9 @@ class RNASampler(nn.Module):
             # Set diagonal to 0
             batch_indices = torch.arange(seq_len, device=coords.device)
             contact_map[:, batch_indices, batch_indices] = 0.0
+            
+            # Clean up computation tensors
+            del rep_coords, diff, batch_indices
         
         # Compute RMSD-like metric
         total_contacts = torch.sum(contact_map)

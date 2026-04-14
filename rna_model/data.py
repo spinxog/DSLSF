@@ -10,16 +10,31 @@ import hashlib
 import threading
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
-import requests
 from Bio import SeqIO
 from Bio.PDB import PDBParser, PDBIO
-import subprocess
 import tempfile
 import os
 import time
-import threading
 from contextlib import contextmanager
+from functools import wraps
 from .utils import tokenize_rna_sequence, compute_contact_map, bin_distances
+
+
+def retry_on_io_error(max_retries: int = 3, delay: float = 1.0):
+    """Decorator to retry I/O operations on failure."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (IOError, OSError) as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(delay * (2 ** attempt))  # Exponential backoff
+            return None
+        return wrapper
+    return decorator
 
 
 # Cross-platform file locking implementation
@@ -129,8 +144,9 @@ class RNADatasetLoader:
         
         return abs_path
     
+    @retry_on_io_error(max_retries=3, delay=1.0)
     def load_pdb_structure(self, pdb_file: Union[str, Path]) -> RNAStructure:
-        """Load RNA structure from PDB file with security validation."""
+        """Load RNA structure from PDB file with security validation and retry logic."""
         pdb_file = self._validate_file_path(pdb_file)
         
         if not pdb_file.exists():

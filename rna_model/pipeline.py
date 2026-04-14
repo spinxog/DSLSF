@@ -87,22 +87,38 @@ class RNAFoldingPipeline:
             )
             
             # Generate decoys
-            decoys = self.sampler.generate_decoys(
-                sequence,
-                lm_outputs["embeddings"],
-                geometry_outputs["coordinates"],
-                return_all_decoys=return_all_decoys
-            )
+            try:
+                decoys, metrics = self.sampler.generate_decoys(
+                    sequence,
+                    lm_outputs["embeddings"],
+                    geometry_outputs["coordinates"],
+                    return_all_decoys=return_all_decoys
+                )
+                self.logger.debug(f"Generated {len(decoys)} decoys in {metrics.total_time:.2f}s")
+            except Exception as e:
+                self.logger.error(f"Error generating decoys: {e}")
+                raise RuntimeError(f"Failed to generate decoys for sequence {sequence[:20]}...: {e}")
             
             # Refinement
             refined_decoys = []
-            for decoy in decoys:
-                refined = self.refiner.refine_structure(decoy["coordinates"])
-                refined_decoys.append({
-                    **decoy,
-                    "coordinates": refined["coordinates"],
-                    "refined": True
-                })
+            for i, decoy in enumerate(decoys):
+                try:
+                    refined = self.refiner.refine_structure(decoy["coordinates"])
+                    refined_decoys.append({
+                        "coordinates": refined["coordinates"],
+                        "confidence": refined["loss"],
+                        "refined": True,
+                        "original_confidence": decoy["confidence"],
+                        "decoy_id": decoy["decoy_id"]
+                    })
+                except Exception as e:
+                    self.logger.warning(f"Refinement failed for decoy {i}, using original: {e}")
+                    refined_decoys.append({
+                        "coordinates": decoy["coordinates"],
+                        "confidence": decoy["confidence"],
+                        "refined": False,
+                        "decoy_id": decoy["decoy_id"]
+                    })
             
             result = {
                 "sequence": sequence,

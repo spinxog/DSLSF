@@ -4,7 +4,7 @@ from .language_model import RNALanguageModel
 from .secondary_structure import SecondaryStructurePredictor
 from .structure_encoder import StructureEncoder
 from .geometry_module import GeometryModule
-from .sampler import RNASampler
+from .sampler import RNASampler, PerformanceMetrics
 from .refinement import GeometryRefiner
 from .pipeline import RNAFoldingPipeline, PipelineConfig
 from .config import GlobalConfig, get_config, validate_config
@@ -17,6 +17,7 @@ __all__ = [
     "StructureEncoder",
     "GeometryModule",
     "RNASampler",
+    "PerformanceMetrics",
     "GeometryRefiner",
     "RNAFoldingPipeline",
     "PipelineConfig",

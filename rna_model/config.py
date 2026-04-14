@@ -5,6 +5,11 @@ from typing import Dict, Any, Optional
 import json
 from pathlib import Path
 
+try:
+    import jsonschema
+except ImportError:
+    jsonschema = None
+
 
 @dataclass
 class GlobalConfig:
@@ -22,6 +27,61 @@ class GlobalConfig:
     DEFAULT_LEARNING_RATE: float = 1e-4
     DEFAULT_WEIGHT_DECAY: float = 1e-5
     DEFAULT_MAX_STEPS: int = 100000
+    
+    def validate(self) -> None:
+        """Validate configuration parameters."""
+        if self.DEFAULT_D_MODEL <= 0 or self.DEFAULT_D_MODEL > 2048:
+            raise ValueError(f"d_model must be between 1 and 2048, got {self.DEFAULT_D_MODEL}")
+        
+        if self.DEFAULT_N_LAYERS <= 0 or self.DEFAULT_N_LAYERS > 24:
+            raise ValueError(f"n_layers must be between 1 and 24, got {self.DEFAULT_N_LAYERS}")
+        
+        if self.DEFAULT_N_HEADS <= 0 or self.DEFAULT_N_HEADS > 32:
+            raise ValueError(f"n_heads must be between 1 and 32, got {self.DEFAULT_N_HEADS}")
+        
+        if self.DEFAULT_D_FF <= 0 or self.DEFAULT_D_FF > 8192:
+            raise ValueError(f"d_ff must be between 1 and 8192, got {self.DEFAULT_D_FF}")
+        
+        if self.DEFAULT_BATCH_SIZE <= 0 or self.DEFAULT_BATCH_SIZE > 64:
+            raise ValueError(f"batch_size must be between 1 and 64, got {self.DEFAULT_BATCH_SIZE}")
+        
+        if not (1e-6 <= self.DEFAULT_LEARNING_RATE <= 1e-1):
+            raise ValueError(f"learning_rate must be between 1e-6 and 1e-1, got {self.DEFAULT_LEARNING_RATE}")
+        
+        if not (1e-8 <= self.DEFAULT_WEIGHT_DECAY <= 1e-2):
+            raise ValueError(f"weight_decay must be between 1e-8 and 1e-2, got {self.DEFAULT_WEIGHT_DECAY}")
+        
+        if self.DEFAULT_MAX_STEPS <= 0 or self.DEFAULT_MAX_STEPS > 1000000:
+            raise ValueError(f"max_steps must be between 1 and 1000000, got {self.DEFAULT_MAX_STEPS}")
+        
+        if self.DEFAULT_MAX_SEQ_LEN <= 0 or self.DEFAULT_MAX_SEQ_LEN > 10000:
+            raise ValueError(f"max_seq_len must be between 1 and 10000, got {self.DEFAULT_MAX_SEQ_LEN}")
+    
+    def validate_schema(self, config_dict: Dict[str, Any]) -> None:
+        """Validate configuration against JSON schema."""
+        if jsonschema is None:
+            return  # Skip schema validation if jsonschema not available
+        
+        schema = {
+            "type": "object",
+            "properties": {
+                "d_model": {"type": "integer", "minimum": 1, "maximum": 2048},
+                "n_layers": {"type": "integer", "minimum": 1, "maximum": 24},
+                "n_heads": {"type": "integer", "minimum": 1, "maximum": 32},
+                "d_ff": {"type": "integer", "minimum": 1, "maximum": 8192},
+                "batch_size": {"type": "integer", "minimum": 1, "maximum": 64},
+                "learning_rate": {"type": "number", "minimum": 1e-6, "maximum": 1e-1},
+                "weight_decay": {"type": "number", "minimum": 1e-8, "maximum": 1e-2},
+                "max_steps": {"type": "integer", "minimum": 1, "maximum": 1000000},
+                "max_seq_len": {"type": "integer", "minimum": 1, "maximum": 10000}
+            },
+            "required": ["d_model", "n_layers", "batch_size", "learning_rate"]
+        }
+        
+        try:
+            jsonschema.validate(config_dict, schema)
+        except jsonschema.ValidationError as e:
+            raise ValueError(f"Configuration validation failed: {e}")
     
     # Competition constants
     DEFAULT_MAX_SEQUENCE_LENGTH: int = 512
