@@ -51,7 +51,7 @@ This implementation combines:
 
 ```bash
 # Clone repository
-git clone <repository-url>
+git clone (https://github.com/spinxog/DSLSF)
 cd DSLSF
 
 # Install dependencies
@@ -361,15 +361,6 @@ mypy rna_model/
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Citation
-
-If you use this code in your research, please cite:
-
-```
-RNA 3D Folding Pipeline: End-to-End Neural Prediction of RNA Structure
-[Authors], [Year]
-```
 
 ## Acknowledgments
 
