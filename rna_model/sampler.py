@@ -121,8 +121,8 @@ class RNASampler(nn.Module):
                 sequence, embeddings, initial_coords, temperature=self.config.temperature
             )
             
-            # Compute confidence score
-            confidence = self._compute_confidence(sequence, coords)
+            # Compute confidence score (pass cached computations to avoid redundancy)
+            confidence = self._compute_confidence(sequence, coords, distances, contact_tensor)
             
             decoys.append({
                 "coordinates": coords,
@@ -200,7 +200,7 @@ class RNASampler(nn.Module):
                 # Check memory usage and clean up adaptively
                 memory_allocated = torch.cuda.memory_allocated()
                 memory_reserved = torch.cuda.memory_reserved()
-                memory_utilization = memory_allocated / max(memory_reserved, 1)
+                memory_utilization = memory_allocated / memory_reserved if memory_reserved > 0 else 0.0
                 
                 # Clean up if memory usage is high (>80%) or every 100 steps
                 if memory_utilization > 0.8 or step % 100 == 0:
@@ -253,6 +253,7 @@ class RNASampler(nn.Module):
             violations = bond_distances < min_dist  # (batch_size, seq_len-1, n_atoms)
             
             if violations.any():
+                self.logger.debug(f"Found {violations.sum().item()} bond violations")
                 # Compute directions for violating bonds only
                 bond_directions = bond_vectors / (bond_distances + 1e-8)  # Normalized directions
                 
@@ -286,6 +287,7 @@ class RNASampler(nn.Module):
             contact_violations = (distances < min_dist) & (contact_tensor > 0)  # (batch_size, seq_len, seq_len)
             
             if contact_violations.any():
+                self.logger.debug(f"Found {contact_violations.sum().item()} contact violations")
                 # Compute direction vectors only for violations
                 rep_coords_expanded_i = rep_coords.unsqueeze(2)  # (batch_size, seq_len, 1, 3)
                 rep_coords_expanded_j = rep_coords.unsqueeze(1)  # (batch_size, 1, seq_len, 3)
@@ -304,22 +306,31 @@ class RNASampler(nn.Module):
         
         return coords
     
-    def _compute_confidence(self, sequence: str, coords: torch.Tensor) -> float:
+    def _compute_confidence(self, sequence: str, coords: torch.Tensor, 
+                        cached_distances: Optional[torch.Tensor] = None,
+                        cached_contact_map: Optional[torch.Tensor] = None) -> float:
         """Compute confidence score for a structure."""
         # Use tensor operations to avoid CPU/GPU transfers
         seq_len = len(sequence)
         if seq_len < 3:
             return 0.5
         
-        # Compute contact map using tensor operations
-        rep_coords = coords[:, :, 0, :]  # (batch_size, seq_len, 3)
-        diff = rep_coords.unsqueeze(2) - rep_coords.unsqueeze(1)  # (batch_size, seq_len, seq_len, 3)
-        distances = torch.norm(diff, dim=-1)  # (batch_size, seq_len, seq_len)
-        contact_map = (distances < self.config.contact_threshold).float()  # (batch_size, seq_len, seq_len)
-        
-        # Set diagonal to 0
-        batch_indices = torch.arange(seq_len, device=coords.device)
-        contact_map[:, batch_indices, batch_indices] = 0.0
+        # Use cached computations if available, otherwise compute
+        if cached_distances is not None and cached_contact_map is not None:
+            distances = cached_distances
+            contact_map = cached_contact_map
+            self.logger.debug("Using cached distances and contact map for confidence computation")
+        else:
+            self.logger.debug("Computing distances and contact map for confidence computation")
+            # Compute contact map using tensor operations
+            rep_coords = coords[:, :, 0, :]  # (batch_size, seq_len, 3)
+            diff = rep_coords.unsqueeze(2) - rep_coords.unsqueeze(1)  # (batch_size, seq_len, seq_len, 3)
+            distances = torch.norm(diff, dim=-1)  # (batch_size, seq_len, seq_len)
+            contact_map = (distances < self.config.contact_threshold).float()  # (batch_size, seq_len, seq_len)
+            
+            # Set diagonal to 0
+            batch_indices = torch.arange(seq_len, device=coords.device)
+            contact_map[:, batch_indices, batch_indices] = 0.0
         
         # Compute RMSD-like metric
         total_contacts = torch.sum(contact_map)
