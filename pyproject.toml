@@ -1,0 +1,163 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rna-3d-folding"
+version = "0.1.0"
+description = "State-of-the-art RNA 3D structure prediction pipeline"
+authors = [
+    {name = "RNA Folding Team", email = "team@rnafold.org"},
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: 3.11",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["rna", "3d", "structure", "prediction", "folding", "bioinformatics"]
+
+[project.urls]
+Homepage = "https://github.com/rnafold/rna-3d-folding"
+Repository = "https://github.com/rnafold/rna-3d-folding"
+Documentation = "https://rna-3d-folding.readthedocs.io"
+
+[tool.setuptools]
+packages = ["rna_model"]
+
+[tool.setuptools.dynamic]
+dependencies = {optional = true}
+
+[tool.setuptools.optional]
+dev = [
+    "pytest>=6.0",
+    "pytest-cov>=2.0",
+    "black>=21.0",
+    "isort>=5.0",
+    "mypy>=0.910",
+    "flake8>=3.9",
+    "pre-commit>=2.15",
+]
+
+docs = [
+    "sphinx>=4.0",
+    "sphinx-rtd-theme>=1.0",
+    "myst-parser>=0.17",
+]
+
+benchmark = [
+    "matplotlib>=3.5",
+    "seaborn>=0.11",
+    "pandas>=1.3",
+    "jupyter>=1.0",
+]
+
+[tool.setuptools.package-data]
+rna_model = [
+    "data/motif_library/*.json",
+    "data/parameters/*.npz",
+    "configs/*.yaml",
+]
+
+[tool.setuptools.entry-points."console_scripts]
+rna-predict = "rna_model.cli.predict:predict_command"
+rna-train = "rna_model.cli.train:train_command"
+rna-evaluate = "rna_model.cli.evaluate:evaluate_command"
+rna-prepare = "rna_model.cli.prepare_data:prepare_data_command"
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+line_length = 88
+known_first_party = ["rna_model"]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = "rna_model.*"
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "--cov=tests",
+    "--cov-report=html",
+    "--cov-report=term-missing",
+]
+
+[tool.coverage.run]
+source = ["rna_model"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "setup.py",
+]
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203", "W503"]
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    ".eggs",
+    "*.egg-info",
+    ".venv",
+    ".tox",
+]
+
+[tool.pre-commit]
+repos = [
+    {repo = "local:", hooks = {id = "black"}, language_version = "python3"},
+    {repo = "local:", hooks = {id = "isort"}, language_version = "python3"},
+    {repo = "local:", hooks = {id = "mypy"}, language_version = "python3"},
+    {repo = "local:", hooks = {id = "flake8"}, language_version = "python3"},
+    {repo = "local:", hooks = {id = "pytest"}, language_version = "python3"},
+]
