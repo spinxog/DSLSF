@@ -17,6 +17,7 @@ import os
 import time
 from contextlib import contextmanager
 from functools import wraps
+import asyncio
 from .utils import tokenize_rna_sequence, compute_contact_map, bin_distances
 
 
@@ -379,13 +380,11 @@ class RNADatasetLoader:
             contacts = compute_contact_map(coordinates[:, 0, :])
             
             structure = RNAStructure(
-                sequence=seq,
-                coordinates=coordinates,
+                sequence="".join(residue_names),
+                coordinates=np.array(coordinates),
                 atom_names=atom_names,
                 residue_names=residue_names,
-                chain_id="A",
-                pdb_id=f"synthetic_{len(synthetic_structures)}",
-                contacts=contacts
+                metadata={"source": "synthetic"}
             )
             
             synthetic_structures.append(structure)

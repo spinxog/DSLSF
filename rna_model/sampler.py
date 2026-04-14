@@ -25,6 +25,9 @@ class SamplerConfig:
     n_steps: int = 1000
     contact_threshold: float = 8.0
     rmsd_threshold: float = 5.0
+    early_stopping_patience: int = 50  # Steps to wait for improvement
+    convergence_threshold: float = 1e-6  # Minimum improvement to continue
+    max_time_seconds: float = 300.0  # Maximum time per decoy
 
 
 @dataclass
@@ -260,21 +263,6 @@ class RNASampler(nn.Module):
                 
                 # Apply rotation vectorized
                 rotation_matrix = self.rigid_transform.quaternion_to_matrix(quat)
-                coords = torch.bmm(coords.view(-1, 3), rotation_matrix).view(batch_size, seq_len, 3, 3)
-                
-                # Clean up quaternion
-                del quat
-            
-            # Apply small random translations
-            if random.random() < 0.5:
-                translation = torch.randn(batch_size, 3) * 0.5 * temperature
-                coords = coords + translation.unsqueeze(1)
-                
-                # Clean up translation
-                del translation
-            
-            # Apply constraints
-            coords = self._apply_constraints(coords, sequence)
             
             # Adaptive GPU cache cleanup based on memory usage
             if torch.cuda.is_available():
@@ -288,8 +276,45 @@ class RNASampler(nn.Module):
                     torch.cuda.empty_cache()
                     if step % 100 == 0:  # Log cleanup every 100 steps
                         self.logger.debug(f"GPU cache cleanup at step {step}, memory usage: {memory_utilization:.2%}")
+            
+            # Calculate current energy (simple approximation)
+            current_energy = self._calculate_energy(coords, sequence)
+            
+            # Check for improvement
+            if current_energy < best_energy - self.config.convergence_threshold:
+                best_coords = coords.clone()
+                best_energy = current_energy
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            
+            # Early stopping check
+            if patience_counter >= self.config.early_stopping_patience:
+                self.logger.debug(f"Early stopping at step {step} (patience: {patience_counter})")
+                break
         
-        return coords
+        self.logger.debug(f"Sampling completed: {step+1} steps, final energy: {best_energy:.6f}")
+        return best_coords
+    
+    def _calculate_energy(self, coords: torch.Tensor, sequence: str) -> float:
+        """Calculate approximate energy for early stopping."""
+        # Simple energy based on bond violations and contacts
+        try:
+            # Apply constraints temporarily to check violations
+            constrained_coords = self._apply_constraints(coords.clone(), sequence)
+            
+            # Count violations as energy proxy
+            rep_coords = constrained_coords[:, :, 0, :]
+            diff = rep_coords.unsqueeze(2) - rep_coords.unsqueeze(1)
+            distances = torch.norm(diff, dim=-1)
+            
+            # Energy = number of violations + distance penalties
+            bond_violations = torch.sum(distances < self.config.min_distance)
+            energy = bond_violations.item() + torch.mean(distances).item()
+            
+            return energy
+        except Exception:
+            return float('inf')  # Return high energy on error
     
     def _apply_constraints(self, coords: torch.Tensor, sequence: str) -> torch.Tensor:
         """Apply geometric constraints to coordinates."""

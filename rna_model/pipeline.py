@@ -147,7 +147,127 @@ class RNAFoldingPipeline:
         tokens = [token_map.get(nuc, 4) for nucleotide in sequence.upper()]
         return {"tokens": tokens, "length": len(tokens)}
     
-    def load_model(self, model_path: str) -> None:
+    def predict_batch(self, sequences: List[str], return_all_decoys: bool = False) -> List[Dict[str, Any]]:
+        """Predict structures for multiple sequences in batch.
+        
+        Args:
+            sequences: List of RNA sequences to process
+            return_all_decoys: Whether to return all decoys or just the best
+            
+        Returns:
+            List of prediction results, one per sequence
+        """
+        if not sequences:
+            return []
+        
+        self.logger.info(f"Processing batch of {len(sequences)} sequences")
+        
+        # Filter and validate sequences
+        valid_sequences = []
+        invalid_results = []
+        
+        for i, sequence in enumerate(sequences):
+            if not sequence or not isinstance(sequence, str):
+                invalid_results.append({
+                    "sequence": sequence,
+                    "error": "Invalid sequence input",
+                    "success": False,
+                    "batch_index": i
+                })
+                continue
+            
+            if len(sequence) > self.config.max_sequence_length:
+                invalid_results.append({
+                    "sequence": sequence,
+                    "error": f"Sequence too long: {len(sequence)} > {self.config.max_sequence_length}",
+                    "success": False,
+                    "batch_index": i
+                })
+                continue
+            
+            valid_sequences.append((i, sequence))
+        
+        # Process valid sequences in batch
+        batch_results = []
+        if valid_sequences:
+            try:
+                # Tokenize all sequences at once
+                max_len = max(len(seq) for _, seq in valid_sequences)
+                batch_tokens = torch.zeros(len(valid_sequences), max_len, dtype=torch.long, device=self.device)
+                
+                for batch_idx, (_, sequence) in enumerate(valid_sequences):
+                    tokens = self._tokenize_sequence(sequence)
+                    batch_tokens[batch_idx, :len(tokens)] = tokens
+                
+                # Forward pass for batch
+                lm_outputs = self.language_model(batch_tokens)
+                
+                # Process each sequence individually for now (can be further optimized)
+                for orig_idx, sequence in valid_sequences:
+                    seq_idx = next(i for i, (idx, _) in enumerate(valid_sequences) if idx == orig_idx)
+                    seq_tokens = batch_tokens[seq_idx:seq_idx+1]
+                    seq_embeddings = {k: v[seq_idx:seq_idx+1] for k, v in lm_outputs.items()}
+                    
+                    # Rest of pipeline processing
+                    ss_outputs = self.secondary_structure(seq_embeddings["embeddings"])
+                    struct_outputs = self.structure_encoder(seq_embeddings["embeddings"], ss_outputs["contacts"])
+                    geometry_outputs = self.geometry_module(struct_outputs["embeddings"], struct_outputs["pairwise_repr"])
+                    
+                    # Generate decoys
+                    decoys, metrics = self.sampler.generate_decoys(
+                        sequence, seq_embeddings["embeddings"], geometry_outputs["coordinates"],
+                        return_all_decoys=return_all_decoys
+                    )
+                    
+                    # Refinement
+                    refined_decoys = []
+                    for decoy in decoys:
+                        try:
+                            refined = self.refiner.refine_structure(decoy["coordinates"])
+                            refined_decoys.append({
+                                "coordinates": refined["coordinates"],
+                                "confidence": refined["loss"],
+                                "refined": True,
+                                "original_confidence": decoy["confidence"],
+                                "decoy_id": decoy["decoy_id"]
+                            })
+                        except Exception as e:
+                            self.logger.warning(f"Refinement failed, using original: {e}")
+                            refined_decoys.append({
+                                "coordinates": decoy["coordinates"],
+                                "confidence": decoy["confidence"],
+                                "refined": False,
+                                "decoy_id": decoy["decoy_id"]
+                            })
+                    
+                    batch_results.append({
+                        "sequence": sequence,
+                        "n_residues": len(sequence),
+                        "n_decoys": len(refined_decoys),
+                        "coordinates": refined_decoys[0]["coordinates"] if refined_decoys else None,
+                        "confidence": 0.8,
+                        "success": True,
+                        "decoys": refined_decoys if return_all_decoys else refined_decoys[:5],
+                        "batch_index": orig_idx,
+                        "metrics": metrics
+                    })
+                    
+            except Exception as e:
+                self.logger.error(f"Batch processing failed: {e}")
+                # Fall back to individual processing
+                for orig_idx, sequence in valid_sequences:
+                    result = self.predict_single_sequence(sequence, return_all_decoys)
+                    result["batch_index"] = orig_idx
+                    batch_results.append(result)
+        
+        # Combine results maintaining original order
+        all_results = invalid_results + batch_results
+        all_results.sort(key=lambda x: x["batch_index"])
+        
+        self.logger.info(f"Batch processing complete: {len(all_results)} results")
+        return all_results
+    
+    def load_model(self, model_path: str, device: str = "auto") -> bool:
         """Load model from checkpoint with security validation."""
         # Input validation
         if not model_path or not isinstance(model_path, str):

@@ -4,6 +4,9 @@ import torch
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Union, Any
 import math
+import hashlib
+import pickle
+from functools import lru_cache
 
 
 def tokenize_rna_sequence(sequence: str) -> torch.Tensor:
@@ -57,6 +60,28 @@ def compute_contact_map(coords: np.ndarray, threshold: float = 8.0) -> np.ndarra
                 contact_map[i, j] = distance < threshold
     
     return contact_map
+
+
+def tensor_hash(tensor: torch.Tensor) -> str:
+    """Generate hash for tensor caching."""
+    # Convert tensor to bytes and hash
+    tensor_bytes = tensor.detach().cpu().numpy().tobytes()
+    return hashlib.md5(tensor_bytes).hexdigest()
+
+
+@lru_cache(maxsize=1000)
+def cached_distance_matrix(coords_tuple: Tuple) -> np.ndarray:
+    """Cached distance matrix computation."""
+    coords = np.array(coords_tuple).reshape(-1, 3)
+    n_atoms = len(coords)
+    distances = np.zeros((n_atoms, n_atoms))
+    
+    for i in range(n_atoms):
+        for j in range(i + 1, n_atoms):
+            dist = np.linalg.norm(coords[i] - coords[j])
+            distances[i, j] = distances[j, i] = dist
+    
+    return distances
 
 
 def compute_tm_score(coords1: np.ndarray, coords2: np.ndarray) -> float:

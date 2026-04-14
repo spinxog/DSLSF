@@ -15,6 +15,7 @@ from .secondary_structure import SecondaryStructurePredictor, secondary_structur
 from .geometry_module import GeometryModule, geometry_loss, fape_loss
 from .pipeline import IntegratedModel, PipelineConfig
 from .utils import set_seed, clear_cache, memory_usage
+import json
 
 
 @dataclass
@@ -48,8 +49,72 @@ class TrainingConfig:
     accumulate_gradients: int = 1
     
     # Paths
-    checkpoint_dir: str = "checkpoints"
-    log_dir: str = "logs"
+    output_dir: str = "./outputs"
+    resume_from_checkpoint: Optional[str] = None
+    checkpoint_interval: int = 1000  # Save checkpoint every N steps
+    max_checkpoints_to_keep: int = 5  # Keep only last N checkpoints
+
+
+class CheckpointManager:
+    """Manage training checkpoints with automatic cleanup."""
+    
+    def __init__(self, checkpoint_dir: Path, max_checkpoints: int = 5):
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.max_checkpoints = max_checkpoints
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    def save_checkpoint(self, model: nn.Module, optimizer: torch.optim.Optimizer,
+                       scheduler: Any, step: int, epoch: int, loss: float,
+                       config: Dict[str, Any]) -> Path:
+        """Save training checkpoint."""
+        checkpoint_path = self.checkpoint_dir / f"checkpoint_step_{step}.pth"
+        
+        checkpoint = {
+            'step': step,
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+            'loss': loss,
+            'config': config,
+            'timestamp': time.time()
+        }
+        
+        torch.save(checkpoint, checkpoint_path)
+        
+        # Clean up old checkpoints
+        self._cleanup_old_checkpoints()
+        
+        return checkpoint_path
+    
+    def load_checkpoint(self, checkpoint_path: Path) -> Dict[str, Any]:
+        """Load training checkpoint."""
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        return torch.load(checkpoint_path, map_location='cpu')
+    
+    def get_latest_checkpoint(self) -> Optional[Path]:
+        """Get path to latest checkpoint."""
+        checkpoints = list(self.checkpoint_dir.glob("checkpoint_step_*.pth"))
+        if not checkpoints:
+            return None
+        
+        return max(checkpoints, key=lambda p: p.stat().st_mtime)
+    
+    def _cleanup_old_checkpoints(self):
+        """Remove old checkpoints, keeping only the most recent ones."""
+        checkpoints = list(self.checkpoint_dir.glob("checkpoint_step_*.pth"))
+        
+        if len(checkpoints) <= self.max_checkpoints:
+            return
+        
+        # Sort by modification time and remove oldest
+        checkpoints.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        
+        for checkpoint in checkpoints[self.max_checkpoints:]:
+            checkpoint.unlink()
+            logging.info(f"Removed old checkpoint: {checkpoint}")
 
 
 class RNADataset(Dataset):
