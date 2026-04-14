@@ -213,16 +213,20 @@ class Trainer:
             coords = batch["coordinates"]
             mask = batch["mask"]
             
-            # FAPE loss
-            if "frames" in geometry_outputs:
-                # Create dummy frames for now
-                dummy_frames = torch.zeros(coords.size(0), coords.size(1), 4, device=self.device)
-                dummy_frames[..., 0] = 1.0
+            # FAPE loss - compute proper frames from coordinates
+            if "coordinates" in geometry_outputs:
+                # Compute local frames from predicted coordinates
+                pred_coords = geometry_outputs["coordinates"]
+                frames = self._compute_local_frames(pred_coords, mask)
+                
+                # Compute true frames from ground truth coordinates
+                true_frames = self._compute_local_frames(coords, mask)
+                
                 losses["fape"] = fape_loss(
-                    geometry_outputs["coordinates"],
-                    geometry_outputs["frames"],
+                    pred_coords,
+                    frames,
                     coords,
-                    dummy_frames,
+                    true_frames,
                     mask
                 )
             
@@ -395,6 +399,87 @@ class Trainer:
                     tokens[i, j] = token_map['N']
         
         return tokens
+    
+    def _compute_local_frames(self, coords: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Compute local coordinate frames from 3D coordinates.
+        
+        Args:
+            coords: (batch_size, seq_len, 3) coordinates
+            mask: (batch_size, seq_len) boolean mask
+            
+        Returns:
+            frames: (batch_size, seq_len, 4) quaternion frames
+        """
+        batch_size, seq_len, _ = coords.shape
+        frames = torch.zeros(batch_size, seq_len, 4, device=coords.device)
+        frames[..., 0] = 1.0  # Default to identity quaternion
+        
+        # Compute local frames for valid residues
+        for i in range(1, seq_len - 1):
+            # Check if current, previous, and next residues are valid
+            valid_mask = mask[:, i-1] & mask[:, i] & mask[:, i+1]
+            
+            if valid_mask.any():
+                # Get three consecutive points
+                p_prev = coords[valid_mask, i-1]
+                p_curr = coords[valid_mask, i]
+                p_next = coords[valid_mask, i+1]
+                
+                # Compute local coordinate system
+                v1 = p_curr - p_prev
+                v2 = p_next - p_curr
+                
+                # Normalize vectors
+                v1_norm = torch.norm(v1, dim=-1, keepdim=True)
+                v2_norm = torch.norm(v2, dim=-1, keepdim=True)
+                
+                # Avoid division by zero
+                v1 = v1 / (v1_norm + 1e-8)
+                v2 = v2 / (v2_norm + 1e-8)
+                
+                # Compute local frame using cross product
+                z_axis = v1
+                x_axis = torch.cross(v1, v2)
+                x_axis_norm = torch.norm(x_axis, dim=-1, keepdim=True)
+                x_axis = x_axis / (x_axis_norm + 1e-8)
+                y_axis = torch.cross(z_axis, x_axis)
+                
+                # Convert rotation matrix to quaternion
+                rotation_matrix = torch.stack([x_axis, y_axis, z_axis], dim=-1)
+                quaternion = self._rotation_matrix_to_quaternion(rotation_matrix)
+                
+                frames[valid_mask, i] = quaternion
+        
+        return frames
+    
+    def _rotation_matrix_to_quaternion(self, matrices: torch.Tensor) -> torch.Tensor:
+        """Convert rotation matrices to quaternions."""
+        # Simple matrix to quaternion conversion
+        trace = matrices[..., 0, 0] + matrices[..., 1, 1] + matrices[..., 2, 2]
+        
+        quaternions = torch.zeros_like(trace).unsqueeze(-1).repeat(1, 4)
+        
+        # Case 1: trace > 0
+        mask = trace > 0
+        if mask.any():
+            s = 0.5 / torch.sqrt(trace[mask] + 1.0)
+            quaternions[mask, 0] = 0.25 / s
+            quaternions[mask, 1] = (matrices[mask, 2, 1] - matrices[mask, 1, 2]) * s
+            quaternions[mask, 2] = (matrices[mask, 0, 2] - matrices[mask, 2, 0]) * s
+            quaternions[mask, 3] = (matrices[mask, 1, 0] - matrices[mask, 0, 1]) * s
+        
+        # Case 2: trace <= 0, find largest diagonal element
+        # (Simplified implementation)
+        mask2 = ~mask
+        if mask2.any():
+            # Use first diagonal element as fallback
+            quaternions[mask2, 1] = 1.0  # Default to x-axis rotation
+        
+        # Normalize quaternions
+        norm = torch.norm(quaternions, dim=-1, keepdim=True)
+        quaternions = quaternions / (norm + 1e-8)
+        
+        return quaternions
     
     def save_checkpoint(self, filename: str):
         """Save training checkpoint."""

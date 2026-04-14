@@ -81,7 +81,7 @@ class RigidTransform:
         mask1 = trace > 0
         if mask1.any():
             s = 0.5 / torch.sqrt(trace[mask1] + 1.0)
-            q_w[mask1] = 0.25 / s  # Correct: w = 0.25/s, not s/4
+            q_w[mask1] = 0.25 / s  
             q_x[mask1] = (matrices[mask1, 2, 1] - matrices[mask1, 1, 2]) * s
             q_y[mask1] = (matrices[mask1, 0, 2] - matrices[mask1, 2, 0]) * s
             q_z[mask1] = (matrices[mask1, 1, 0] - matrices[mask1, 0, 1]) * s
@@ -145,7 +145,8 @@ class RigidTransform:
             raise ValueError(f"Expected rotations with shape (..., 3, 3) or (..., 4), got {rotations.shape}")
         
         # Apply transformation with proper broadcasting
-        transformed = torch.einsum('...ij,...kj->...ki', rotation_matrices, coords) + translations
+        # coords: (... N, 3), rotation_matrices: (... 3, 3), translations: (... 3)
+        transformed = torch.einsum('...ij,...nj->...ni', rotation_matrices, coords) + translations
         return transformed
 
 
@@ -167,6 +168,7 @@ class InvariantPointAttention(nn.Module):
         # Point attention projections
         self.point_q_proj = nn.Linear(3, self.n_heads * 16)
         self.point_k_proj = nn.Linear(3, self.n_heads * 16)
+        self.point_v_proj = nn.Linear(3, self.n_heads * 16)
         
         # Output projections
         self.out_proj = nn.Linear(self.d_model, self.d_model)
@@ -202,6 +204,7 @@ class InvariantPointAttention(nn.Module):
         rep_coords = coords[..., 1, :]  # Use second atom as representative
         point_q = self.point_q_proj(rep_coords).view(batch_size, seq_len, self.n_heads, 16)
         point_k = self.point_k_proj(rep_coords).view(batch_size, seq_len, self.n_heads, 16)
+        point_v = self.point_v_proj(rep_coords).view(batch_size, seq_len, self.n_heads, 16)
         
         # Compute attention scores
         seq_scores = torch.einsum('bihd,bjhd->bhij', q, k) * self.scale
@@ -226,7 +229,7 @@ class InvariantPointAttention(nn.Module):
         seq_context = seq_context.contiguous().view(batch_size, seq_len, self.d_model)
         
         # Apply attention to point coordinates
-        point_context = torch.einsum('bhij,bjhd->bihd', attn_weights, point_q)
+        point_context = torch.einsum('bhij,bjhd->bihd', attn_weights, point_v)
         point_context = point_context.contiguous().view(batch_size, seq_len, self.n_heads * 16)
         
         # Output projections
