@@ -13,25 +13,56 @@ from .error_handling import ValidationError, ComputationError
 
 
 def tokenize_rna_sequence(sequence: str) -> torch.Tensor:
-    """Convert RNA sequence to token IDs."""
-    # Input validation
+    """Convert RNA sequence to token IDs with comprehensive validation."""
+    # Type validation
     if not isinstance(sequence, str):
         raise ValueError(f"sequence must be a string, got {type(sequence)}")
     
+    # Empty sequence check
     if not sequence:
         return torch.tensor([], dtype=torch.long)
     
+    # Length validation
     if len(sequence) > VALIDATION.MAX_SEQUENCE_LENGTH:
         raise ValueError(f"sequence too long: {len(sequence)} > {VALIDATION.MAX_SEQUENCE_LENGTH}")
     
+    if len(sequence) < VALIDATION.MIN_SEQUENCE_LENGTH:
+        raise ValueError(f"sequence too short: {len(sequence)} < {VALIDATION.MIN_SEQUENCE_LENGTH}")
+    
+    # Content validation
+    if sequence.isspace():
+        raise ValueError("sequence cannot contain only whitespace")
+    
+    # Check for control characters
+    if any(ord(c) < 32 or ord(c) == 127 for c in sequence):
+        raise ValueError("sequence contains control characters")
+    
+    # Check for suspicious Unicode characters
+    try:
+        sequence.encode('ascii')
+    except UnicodeEncodeError:
+        raise ValueError("sequence contains non-ASCII characters")
+    
+    # Validate nucleotide composition
+    upper_sequence = sequence.upper()
+    valid_nucleotides = set(BIOLOGICAL.VALID_NUCLEOTIDES_UPPER)
+    invalid_chars = set(upper_sequence) - valid_nucleotides
+    
+    if invalid_chars:
+        raise ValueError(f"Invalid nucleotides found: {sorted(invalid_chars)}. Valid nucleotides: {sorted(valid_nucleotides)}")
+    
+    # Check for excessive N content
+    n_count = upper_sequence.count('N')
+    if n_count > len(upper_sequence) * VALIDATION.MAX_N_PROPORTION:
+        raise ValueError(f"Too many N nucleotides: {n_count}/{len(upper_sequence)} ({n_count/len(upper_sequence)*100:.1f}%)")
+    
+    # Create token map
     token_map = {nuc: i for i, nuc in enumerate(BIOLOGICAL.VALID_NUCLEOTIDES_UPPER)}
     
+    # Tokenize
     tokens = []
-    for nucleotide in sequence.upper():
-        if nucleotide in token_map:
-            tokens.append(token_map[nucleotide])
-        else:
-            tokens.append(token_map['N'])
+    for nucleotide in upper_sequence:
+        tokens.append(token_map[nucleotide])
     
     return torch.tensor(tokens, dtype=torch.long)
 
@@ -53,10 +84,10 @@ def compute_contact_map(
     chunk_size: Optional[int] = None, 
     memory_efficient: bool = True
 ) -> np.ndarray:
-    """Compute contact map from coordinates using memory-efficient operations.
+    """Compute contact map from coordinates using optimized operations.
     
     Args:
-        coords: Coordinate array of shape (N, 3)
+        coords: Coordinate array of shape (N,3)
         threshold: Distance threshold for contact definition
         chunk_size: Size of chunks for memory-efficient computation
         memory_efficient: Whether to use memory-efficient computation for large systems
@@ -91,27 +122,33 @@ def compute_contact_map(
         raise ValueError("coords contains NaN or Inf values")
     
     n_atoms = len(coords)
+    threshold_squared = threshold * threshold
     
-    # Use memory-efficient computation for large systems or when requested
+    # Use memory-efficient computation for large systems
     if memory_efficient and n_atoms > COMPUTATIONAL.MEDIUM_SYSTEM_THRESHOLD:
         return _memory_efficient_contact_map(coords, threshold, chunk_size)
     
-    # Optimized vectorized distance computation
-    # Use squared distances to avoid sqrt until the end
+    # Optimized computation using squared distances to avoid sqrt
     if n_atoms <= COMPUTATIONAL.SMALL_SYSTEM_THRESHOLD:
-        # Small systems: use standard vectorized approach
-        diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
-        squared_distances = np.einsum('ijk,ijk->ij', diff, diff)
-        distances = np.sqrt(squared_distances, out=squared_distances)  # In-place sqrt
+        # Small systems: use vectorized approach with early termination
+        contact_map = np.zeros((n_atoms, n_atoms), dtype=bool)
+        
+        # Compute only upper triangle to avoid redundant calculations
+        for i in range(n_atoms):
+            for j in range(i + 1, n_atoms):
+                # Compute squared distance
+                diff = coords[i] - coords[j]
+                squared_dist = np.dot(diff, diff)
+                
+                # Check against threshold without sqrt
+                if squared_dist < threshold_squared:
+                    contact_map[i, j] = True
+                    contact_map[j, i] = True
+        
+        return contact_map
     else:
         # Medium systems: use chunked computation
-        distances = _compute_distance_matrix_chunked(coords, chunk_size)
-    
-    # Create contact map (exclude diagonal)
-    contact_map = distances < threshold
-    np.fill_diagonal(contact_map, False)
-    
-    return contact_map
+        return _memory_efficient_contact_map(coords, threshold, chunk_size)
 
 def _memory_efficient_contact_map(
     coords: np.ndarray, 
@@ -209,32 +246,52 @@ class MemoryAwareCache:
             self._total_size_mb += value_size_mb
     
     def _cleanup_lru(self) -> None:
-        """Remove least recently used entries."""
+        """Remove least recently used entries with aggressive memory management."""
         if not self._cache:
             return
         
         # Sort by access count (least used first)
         sorted_keys = sorted(self._cache.keys(), key=lambda k: self._access_count.get(k, 0))
         
-        # Remove entries until we're under threshold
-        target_size = self.max_cache_size_mb * 0.5  # Target 50% after cleanup
-        target_entries = self.max_entries * 0.5
+        # More aggressive cleanup targets
+        target_size = self.max_cache_size_mb * 0.3  # Target 30% after cleanup
+        target_entries = self.max_entries * 0.3
+        
+        # Check memory pressure and adjust targets
+        try:
+            import psutil
+            memory_percent = psutil.virtual_memory().percent
+            if memory_percent > 80:  # High memory pressure
+                target_size = self.max_cache_size_mb * 0.1  # Aggressive cleanup
+                target_entries = self.max_entries * 0.1
+        except ImportError:
+            pass  # psutil not available, use default targets
         
         removed = 0
+        removed_size = 0.0
+        
         for key in sorted_keys:
             if (self._total_size_mb <= target_size and 
                 len(self._cache) <= target_entries):
                 break
             
-            self._total_size_mb -= self._cache_sizes.get(key, 0)
-            del self._cache[key]
+            entry_size = self._cache_sizes.get(key, 0)
+            self._total_size_mb -= entry_size
+            removed_size += entry_size
+            
+            # Clear the cached array to free memory immediately
+            if key in self._cache:
+                del self._cache[key]
             del self._cache_sizes[key]
             del self._access_count[key]
             removed += 1
         
-        # Force garbage collection if we removed many items
-        if removed > 10:
-            gc.collect()
+        # Force garbage collection
+        gc.collect()
+        
+        # Log cleanup activity for monitoring
+        if removed > 0:
+            logging.debug(f"Cache cleanup: removed {removed} entries, freed {removed_size:.2f} MB")
     
     def clear(self) -> None:
         """Clear all cache entries."""

@@ -14,7 +14,6 @@ import sys
 import json
 import argparse
 import logging
-import pickle
 import lmdb
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -588,8 +587,17 @@ class FragmentLibraryManager:
                 motif_type = key_str.split('_')[0]
                 
                 if motif_type in fragments:
-                    fragment = pickle.loads(value)
-                    fragments[motif_type].append(fragment)
+                    # Safe JSON deserialization with validation
+                    try:
+                        fragment_data = json.loads(value.decode())
+                        # Validate fragment structure
+                        if self._validate_fragment(fragment_data):
+                            fragments[motif_type].append(fragment_data)
+                        else:
+                            logging.warning(f"Invalid fragment structure for key: {key_str}")
+                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                        logging.error(f"Failed to decode fragment for key {key_str}: {e}")
+                        continue
         
         return fragments
     
@@ -611,6 +619,42 @@ class FragmentLibraryManager:
         scored_fragments.sort(key=lambda x: x[0], reverse=True)
         
         return [fragment for _, fragment in scored_fragments[:top_k]]
+    
+    def _validate_fragment(self, fragment: Dict) -> bool:
+        """Validate fragment structure to prevent malicious data injection."""
+        if not isinstance(fragment, dict):
+            return False
+        
+        # Required fields
+        required_fields = ['sequence', 'coordinates', 'motif_type']
+        if not all(field in fragment for field in required_fields):
+            return False
+        
+        # Validate sequence
+        if not isinstance(fragment['sequence'], str) or len(fragment['sequence']) == 0:
+            return False
+        
+        # Validate coordinates
+        coords = fragment['coordinates']
+        if not isinstance(coords, list) or len(coords) == 0:
+            return False
+        
+        # Check coordinate structure
+        for coord in coords:
+            if not isinstance(coord, list) or len(coord) != 3:
+                return False
+            for val in coord:
+                if not isinstance(val, (int, float)):
+                    return False
+                if abs(val) > 1000:  # Reasonable coordinate range
+                    return False
+        
+        # Validate motif type
+        valid_motifs = {'hairpin', 'internal_loop', 'junction', 'pseudoknot'}
+        if fragment['motif_type'] not in valid_motifs:
+            return False
+        
+        return True
     
     def compute_sequence_similarity(self, seq1: str, seq2: str) -> float:
         """Compute sequence similarity."""

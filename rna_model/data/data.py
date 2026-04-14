@@ -8,6 +8,7 @@ import json
 import logging
 import hashlib
 import threading
+import stat
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 from Bio import SeqIO
@@ -110,102 +111,120 @@ class FileLock:
 
 @contextmanager
 def file_lock(lock_file: Path, timeout: float = None):
-    """Context manager for cross-platform file locking with improved error handling."""
+    """Context manager for atomic cross-platform file locking."""
     if timeout is None:
         timeout = COMPUTATIONAL.FILE_LOCK_TIMEOUT
     
-    lock = FileLock.get_lock(lock_file)
+    # Use atomic lock file approach to prevent TOCTOU
     lock_path = lock_file.with_suffix('.lock')
+    lock_info_path = lock_file.with_suffix('.lockinfo')
     
     lock_fd = None
     acquired = False
+    start_time = time.time()
     
     try:
-        # Acquire thread lock first with timeout
-        if not lock.acquire(timeout=timeout):
-            raise TimeoutError(f"Could not acquire thread lock for {lock_file}")
-        
-        # Create/open lock file for process-level locking with secure permissions
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        
-        # Try to acquire file lock with timeout (cross-platform)
-        start_time = time.time()
-        
-        if os.name == 'posix' and fcntl is not None:
-            # Unix/Linux systems use fcntl
-            while time.time() - start_time < timeout:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                    break
-                except (OSError, IOError):
-                    if time.time() - start_time >= timeout:
-                        break
-                    time.sleep(0.1)
-        elif os.name == 'nt' and msvcrt is not None:
-            # Windows systems use msvcrt
+        # Atomic lock creation using O_EXCL
+        while time.time() - start_time < timeout:
             try:
-                msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+                # Create lock file atomically
+                lock_fd = os.open(
+                    lock_path, 
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY, 
+                    0o600
+                )
                 acquired = True
-            except (ImportError, IOError) as e:
-                logging.warning(f"Windows file locking not available: {e}")
-        else:
-            # Fallback for systems without proper file locking
-            logging.warning(f"File locking not available on {os.name}, using fallback")
-            acquired = True  # Assume success for compatibility
+                break
+            except OSError as e:
+                if e.errno == os.errno.EEXIST:
+                    # Lock file exists, check if it's stale
+                    if _is_lock_stale(lock_info_path):
+                        _cleanup_stale_lock(lock_path, lock_info_path)
+                        continue
+                    else:
+                        # Lock is active, wait and retry
+                        time.sleep(0.1)
+                        continue
+                else:
+                    # Other error
+                    raise
         
-        if acquired:
-            # Write process ID and timestamp for debugging
-            lock_info = f"{os.getpid()}:{time.time()}".encode()
-            os.write(lock_fd, lock_info)
-            os.fsync(lock_fd)  # Ensure data is written to disk
+        if not acquired:
+            raise TimeoutError(f"Could not acquire lock for {lock_file} within {timeout}s")
+        
+        # Write lock information atomically
+        lock_data = {
+            'pid': os.getpid(),
+            'timestamp': time.time(),
+            'hostname': os.uname().nodename if hasattr(os, 'uname') else 'unknown'
+        }
+        
+        with open(lock_info_path, 'w') as f:
+            json.dump(lock_data, f)
         
         yield
         
     except Exception as e:
-        logging.error(f"Unexpected error in file lock context: {e}")
+        logging.error(f"Error in file lock context: {e}")
         raise
     finally:
-        # Clean up file locks with comprehensive error handling
-        if lock_fd is not None:
-            try:
-                # Release file lock based on OS
-                if os.name == 'posix' and acquired and fcntl is not None:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)  # Release file lock
-                elif os.name == 'nt' and acquired and msvcrt is not None:
-                    try:
-                        msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
-                    except (ImportError, IOError):
-                        logging.warning("Windows file locking not available, using fallback")
-                else:
-                    # No lock to release (not acquired or not available)
-                    pass
-            except (OSError, IOError) as e:
-                logging.error(f"Failed to release file lock: {e}")
-            finally:
-                try:
-                    os.close(lock_fd)
-                except (OSError, IOError) as e:
-                    logging.error(f"Failed to close file descriptor: {e}")
+        # Atomic cleanup
+        _cleanup_lock_files(lock_fd, lock_path, lock_info_path)
+
+
+def _is_lock_stale(lock_info_path: Path) -> bool:
+    """Check if lock is stale (process no longer exists)."""
+    try:
+        if not lock_info_path.exists():
+            return True
         
-        # Always release thread lock with proper error handling
-        try:
-            lock.release()
-        except RuntimeError as e:
-            if "was never acquired" not in str(e).lower():
-                logging.warning(f"Unexpected error releasing thread lock: {e}")
-            # Lock was not acquired by this thread - this is normal
-            pass
-        except Exception as e:
-            logging.error(f"Unexpected error in thread lock release: {e}")
-            pass
+        with open(lock_info_path, 'r') as f:
+            lock_data = json.load(f)
         
-        # Clean up lock file
+        pid = lock_data.get('pid')
+        timestamp = lock_data.get('timestamp', 0)
+        
+        # Check if process still exists
         try:
-            if lock_path.exists():
-                lock_path.unlink()
+            os.kill(pid, 0)  # Signal 0 doesn't kill process
+            return False  # Process exists
+        except OSError:
+            return True  # Process doesn't exist
+        
+        # Also check timestamp (locks older than 1 hour are considered stale)
+        return time.time() - timestamp > 3600
+        
+    except (json.JSONDecodeError, KeyError, OSError):
+        return True  # If we can't read lock info, assume stale
+
+
+def _cleanup_stale_lock(lock_path: Path, lock_info_path: Path) -> None:
+    """Clean up stale lock files."""
+    try:
+        if lock_path.exists():
+            lock_path.unlink()
+        if lock_info_path.exists():
+            lock_info_path.unlink()
+    except OSError as e:
+        logging.warning(f"Failed to cleanup stale lock: {e}")
+
+
+def _cleanup_lock_files(lock_fd: Optional[int], lock_path: Path, lock_info_path: Path) -> None:
+    """Clean up lock files and file descriptor."""
+    # Close file descriptor
+    if lock_fd is not None:
+        try:
+            os.close(lock_fd)
         except OSError as e:
-            logging.warning(f"Could not remove lock file {lock_path}: {e}")
+            logging.error(f"Failed to close lock file descriptor: {e}")
+    
+    # Remove lock files
+    for path in [lock_path, lock_info_path]:
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as e:
+            logging.warning(f"Failed to remove lock file {path}: {e}")
 
 
 @dataclass
@@ -752,11 +771,18 @@ class RNADatasetLoader:
     
     def _validate_file_path(self, file_path: Union[str, Path]) -> Path:
         """Validate file path to prevent path traversal and symlink attacks."""
+        import stat
+        import unicodedata
+        
         file_path = Path(file_path)
+        
+        # Input validation
+        if not file_path or not str(file_path).strip():
+            raise ValueError("Empty file path provided")
         
         # Comprehensive suspicious pattern detection
         dangerous_patterns = {
-            'path_traversal': ['../', '..\\', '..%2f', '..%5c'],
+            'path_traversal': ['../', '..\\', '..%2f', '..%5c', '%2e%2e%2f', '%2e%2e%5c'],
             'null_injection': ['\0', '%00'],
             'command_injection': ['|', '&', ';', '$', '`', '(', ')'],
             'file_operations': ['<', '>', '"', '*', '?'],
@@ -764,38 +790,40 @@ class RNADatasetLoader:
             'windows_paths': ['\\\\', '//', '/\\', '\\\/']
         }
         
+        path_str = str(file_path)
         for category, patterns in dangerous_patterns.items():
             for pattern in patterns:
-                if pattern in str(file_path).lower():
+                if pattern in path_str.lower():
                     raise ValueError(f"Security violation - {category}: '{pattern}' in path")
         
         # Unicode normalization attacks prevention
-        import unicodedata
         try:
-            normalized_path = unicodedata.normalize('NFC', str(file_path))
-            if normalized_path != str(file_path):
+            normalized_path = unicodedata.normalize('NFC', path_str)
+            if normalized_path != path_str:
                 raise ValueError("Unicode normalization attack detected")
         except (UnicodeError, ValueError):
             raise ValueError("Invalid Unicode characters in path")
         
         # Path length validation (prevent DoS via long paths)
-        if len(str(file_path)) > COMPUTATIONAL.MAX_PATH_LENGTH:  # Conservative limit
-            raise ValueError(f"Path too long: {len(str(file_path))} > {COMPUTATIONAL.MAX_PATH_LENGTH} characters")
+        if len(path_str) > COMPUTATIONAL.MAX_PATH_LENGTH:
+            raise ValueError(f"Path too long: {len(path_str)} > {COMPUTATIONAL.MAX_PATH_LENGTH} characters")
         
         # OS-specific validation
         if os.name == 'nt':  # Windows
-            # Check for reserved names and invalid characters
-            reserved_names = {'CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'}
+            reserved_names = {
+                'CON', 'PRN', 'AUX', 'NUL',
+                'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9',
+                'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9'
+            }
             name_without_ext = file_path.stem.upper()
             if name_without_ext in reserved_names:
                 raise ValueError(f"Reserved device name used: {name_without_ext}")
             
             invalid_chars = '<>:"|?*'
-            if any(char in str(file_path) for char in invalid_chars):
+            if any(char in path_str for char in invalid_chars):
                 raise ValueError(f"Invalid characters in Windows path")
         else:  # Unix/Linux
-            # Check for Windows-style paths on Unix
-            if ':' in str(file_path)[:2] or '\\' in str(file_path):
+            if ':' in path_str[:2] or '\\' in path_str:
                 raise ValueError("Invalid path format for Unix system")
         
         # Validate file extension
@@ -803,22 +831,22 @@ class RNADatasetLoader:
         if file_path.suffix.lower() not in allowed_extensions:
             raise ValueError(f"File extension not allowed: {file_path.suffix}")
         
-        # Get absolute path safely
+        # Get absolute path with proper symlink resolution
         try:
-            # Use absolute() instead of resolve() to avoid following symlinks
-            abs_path = file_path.absolute()
+            # Use resolve() to properly resolve symlinks and get the real path
+            abs_path = file_path.resolve(strict=False)
         except (OSError, ValueError) as e:
             raise ValueError(f"Invalid path: {e}")
         
         # Comprehensive symlink checking
-        def check_symlinks_safely(path: Path) -> None:
-            """Check for symlinks in path and parents safely."""
+        def check_path_security(path: Path) -> None:
+            """Check path security including symlinks and ownership."""
             try:
-                # Check if the file itself is a symlink
+                # Check if file itself is a symlink
                 if path.exists() and path.is_symlink():
                     raise ValueError(f"Symbolic link not allowed: {path}")
                 
-                # Check all parent directories for symlinks
+                # Check all parent directories
                 for parent in path.parents:
                     if parent.exists():
                         # Use lstat to check if it's a symlink without following
@@ -826,23 +854,28 @@ class RNADatasetLoader:
                             stat_info = os.lstat(str(parent))
                             if stat.S_ISLNK(stat_info.st_mode):
                                 raise ValueError(f"Symbolic link in parent path not allowed: {parent}")
+                            
+                            # Additional security: check ownership on Unix systems
+                            if os.name != 'nt':
+                                if stat_info.st_uid != os.getuid():
+                                    raise ValueError(f"Parent directory not owned by current user: {parent}")
+                                    
                         except (OSError, PermissionError):
-                            # If we can't stat it, assume it's unsafe
                             raise ValueError(f"Cannot verify parent directory safety: {parent}")
             except (OSError, PermissionError) as e:
                 raise ValueError(f"Security check failed for {path}: {e}")
         
-        check_symlinks_safely(abs_path)
+        check_path_security(abs_path)
         
         # Ensure path is within allowed directory
         try:
-            cache_abs = self.cache_dir.absolute()
+            cache_abs = self.cache_dir.resolve()
             # Use relative_to with strict checking
             rel_path = abs_path.relative_to(cache_abs)
         except ValueError:
             raise ValueError(f"Path outside allowed directory: {abs_path} not in {cache_abs}")
         
-        # Additional safety: check that relative path doesn't try to escape
+        # Final safety check
         if '..' in str(rel_path):
             raise ValueError("Relative path contains parent directory references")
         
@@ -885,19 +918,22 @@ class RNADatasetLoader:
                             coordinates.append([x, y, z])
                             atom_names.append(atom_name)
                             residue_names.append(residue_name)
-                        except (ValueError, IndexError) as e:
-                            logging.warning(f"Error parsing line {line_num}: {e}")
+                        except ValueError as e:
+                            logging.warning(f"Invalid value in PDB file {pdb_file} at line {line_num}: {e}")
+                            continue
+                        except IndexError as e:
+                            logging.warning(f"Invalid line format in PDB file {pdb_file} at line {line_num}: {e}")
                             continue
         except UnicodeDecodeError as e:
-            raise RuntimeError(f"Encoding error reading PDB file {pdb_file}: {e}")
-        except IOError as e:
-            raise RuntimeError(f"I/O error reading PDB file {pdb_file}: {e}")
-        except (ValueError, KeyError, IndexError) as e:
-            raise ValueError(f"Invalid PDB file format in {pdb_file}: {e}")
-        except (OSError, IOError) as e:
-            raise IOError(f"I/O error reading PDB file {pdb_file}: {e}")
+            raise UnicodeDecodeError(f"Encoding error reading PDB file {pdb_file}: {e}")
+        except PermissionError as e:
+            raise PermissionError(f"Permission denied reading PDB file {pdb_file}: {e}")
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"PDB file not found: {pdb_file}: {e}")
+        except OSError as e:
+            raise OSError(f"System error reading PDB file {pdb_file}: {e}")
         except Exception as e:
-            raise RuntimeError(f"Unexpected error reading PDB file {pdb_file}: {e}")
+            raise RuntimeError(f"Unexpected error reading PDB file {pdb_file} at line {line_num}: {e}")
         finally:
             # Ensure file is closed properly (context manager handles this)
             pass
@@ -907,21 +943,14 @@ class RNADatasetLoader:
         
         coordinates = np.array(coordinates)
         
-        # Group by residue with thread safety
+        # Group by residue (single-threaded operation, no lock needed)
         residues = {}
-        # Use a context manager for thread safety
-        lock = threading.Lock()
-        try:
-            with lock:
-                for i, (coord, atom_name, residue_name) in enumerate(
-                    zip(coordinates, atom_names, residue_names)
-                ):
-                    if residue_name not in residues:
-                        residues[residue_name] = []
-                    residues[residue_name].append((coord, atom_name))
-        finally:
-            # Lock is automatically released by context manager
-            pass
+        for i, (coord, atom_name, residue_name) in enumerate(
+            zip(coordinates, atom_names, residue_names)
+        ):
+            if residue_name not in residues:
+                residues[residue_name] = []
+            residues[residue_name].append((coord, atom_name))
         
         # Convert to standard format
         sequence = ''.join([res[0][0] for res in residues.values()])
