@@ -365,13 +365,29 @@ class Trainer:
         self.save_checkpoint("final_model.pth")
     
     def _tokenize_batch(self, sequences: List[str]) -> torch.Tensor:
-        """Tokenize batch of sequences."""
+        """Tokenize batch of sequences with proper type validation."""
+        if not isinstance(sequences, list):
+            raise TypeError(f"Expected list of sequences, got {type(sequences)}")
+        
+        if not sequences:
+            return torch.empty((0, 0), dtype=torch.long, device=self.device)
+        
+        # Convert all sequences to strings if they aren't already
+        string_sequences = []
+        for seq in sequences:
+            if isinstance(seq, torch.Tensor):
+                # Convert tensor back to string
+                seq = ''.join([['A', 'U', 'G', 'C', 'N'][token.item()] for token in seq])
+            elif not isinstance(seq, str):
+                seq = str(seq)
+            string_sequences.append(seq)
+        
         token_map = {'A': 0, 'U': 1, 'G': 2, 'C': 3, 'N': 4}
         
-        max_len = max(len(seq) for seq in sequences)
-        tokens = torch.zeros(len(sequences), max_len, dtype=torch.long, device=self.device)
+        max_len = max(len(seq) for seq in string_sequences)
+        tokens = torch.zeros(len(string_sequences), max_len, dtype=torch.long, device=self.device)
         
-        for i, seq in enumerate(sequences):
+        for i, seq in enumerate(string_sequences):
             for j, nucleotide in enumerate(seq):
                 if j < max_len and nucleotide in token_map:
                     tokens[i, j] = token_map[nucleotide]

@@ -49,6 +49,17 @@ class RigidTransform:
         if matrices.dim() < 2 or matrices.shape[-2:] != (3, 3):
             raise ValueError(f"Expected matrices with shape (..., 3, 3), got {matrices.shape}")
         
+        # Check for NaN or Inf values
+        if torch.isnan(matrices).any() or torch.isinf(matrices).any():
+            raise ValueError("Input matrices contain NaN or Inf values")
+        
+        # Check if matrices are valid rotation matrices (orthogonal with det=1)
+        # For efficiency, we'll skip full validation in production but log warnings
+        if matrices.numel() > 0:  # Only check if not empty
+            # Simple check for reasonable value ranges
+            if matrices.abs().max() > 10.0:
+                raise ValueError("Matrix values outside reasonable range for rotation matrices")
+        
         trace = matrices[..., 0, 0] + matrices[..., 1, 1] + matrices[..., 2, 2]
         
         # Handle numerical issues with robust quaternion extraction

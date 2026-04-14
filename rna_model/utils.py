@@ -2,7 +2,7 @@
 
 import torch
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union, Any
 import math
 
 
@@ -32,9 +32,23 @@ def decode_tokens(tokens: torch.Tensor) -> str:
 
 
 def compute_tm_score(coords1: np.ndarray, coords2: np.ndarray) -> float:
-    """Compute TM-score between two coordinate sets."""
-    # Simplified TM-score computation
-    # In practice, this would use the proper TM-score algorithm
+    """Compute TM-score between two coordinate sets.
+    
+    Args:
+        coords1: First coordinate set of shape (N, 3)
+        coords2: Second coordinate set of shape (N, 3)
+        
+    Returns:
+        TM-score value between 0 and 1
+        
+    Raises:
+        ValueError: If coordinate arrays have different shapes
+    """
+    if coords1.shape != coords2.shape:
+        raise ValueError(f"Coordinate shapes must match: {coords1.shape} vs {coords2.shape}")
+    
+    if len(coords1) == 0:
+        return 0.0
     
     # Center coordinates
     coords1_centered = coords1 - np.mean(coords1, axis=0)
@@ -125,16 +139,19 @@ def mask_sequence(sequence: str, mask_prob: float = 0.15) -> Tuple[str, List[int
 
 
 def compute_contact_map(coords: np.ndarray, threshold: float = 8.0) -> np.ndarray:
-    """Compute contact map from coordinates."""
-    n_residues = len(coords)
-    contact_map = np.zeros((n_residues, n_residues), dtype=int)
+    """Compute contact map from coordinates using vectorized operations."""
+    if len(coords) == 0:
+        return np.zeros((0, 0), dtype=int)
     
-    for i in range(n_residues):
-        for j in range(i + 1, n_residues):
-            distance = np.linalg.norm(coords[i] - coords[j])
-            if distance < threshold:
-                contact_map[i, j] = 1
-                contact_map[j, i] = 1
+    # Compute pairwise distance matrix using broadcasting
+    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+    distances = np.linalg.norm(diff, axis=2)
+    
+    # Create contact map (symmetric)
+    contact_map = (distances < threshold).astype(int)
+    
+    # Set diagonal to 0 (no self-contacts)
+    np.fill_diagonal(contact_map, 0)
     
     return contact_map
 
@@ -306,8 +323,12 @@ def format_time(seconds: float) -> str:
         return f"{hours}h {remaining_minutes}m"
 
 
-def memory_usage() -> Dict[str, float]:
-    """Get current memory usage."""
+def memory_usage() -> Dict[str, Union[float, bool]]:
+    """Get current memory usage.
+    
+    Returns:
+        Dictionary containing memory usage statistics in GB or cpu_only flag
+    """
     if torch.cuda.is_available():
         return {
             "allocated": torch.cuda.memory_allocated() / 1024**3,  # GB

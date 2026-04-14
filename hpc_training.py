@@ -264,54 +264,77 @@ class HPCTrainer:
             self.best_val_loss = checkpoint['best_val_loss']
         
         # Load optimizer state
-        if self.trainer and 'optimizer_state_dict' in checkpoint:
-            self.trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if self.trainer is not None and hasattr(self.trainer, 'optimizer') and 'optimizer_state_dict' in checkpoint:
+            try:
+                self.trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except AttributeError as e:
+                self.logger.warning(f"Failed to load optimizer state: {e}")
         
         # Load scheduler state
-        if self.trainer and 'scheduler_state_dict' in checkpoint:
-            self.trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if self.trainer is not None and hasattr(self.trainer, 'scheduler') and 'scheduler_state_dict' in checkpoint:
+            try:
+                self.trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            except AttributeError as e:
+                self.logger.warning(f"Failed to load scheduler state: {e}")
     
     def save_checkpoint(self, is_best: bool = False):
-        """Save training checkpoint."""
+        """Save training checkpoint with proper distributed synchronization."""
+        # Synchronize all processes before checkpoint saving
+        if self.is_distributed:
+            dist.barrier()
+        
+        # Only save on rank 0, but ensure all processes are synchronized
         if self.rank != 0:
-            return  # Only save on rank 0
+            # Non-rank 0 processes wait for rank 0 to finish
+            if self.is_distributed:
+                dist.barrier()
+            return
         
-        checkpoint = {
-            'global_step': self.global_step,
-            'epoch': self.epoch,
-            'best_val_loss': self.best_val_loss,
-            'model_state_dict': self.model.module.state_dict() if self.is_distributed else self.model.state_dict(),
-            'optimizer_state_dict': self.trainer.optimizer.state_dict(),
-            'scheduler_state_dict': self.trainer.scheduler.state_dict(),
-            'config': self.config.__dict__,
-            'pipeline_config': self.pipeline_config.__dict__
-        }
-        
-        # Save regular checkpoint
-        checkpoint_path = self.checkpoint_dir / f"checkpoint_step_{self.global_step}.pth"
-        torch.save(checkpoint, checkpoint_path)
-        
-        # Save best model
-        if is_best:
-            best_path = self.checkpoint_dir / "best_model.pth"
-            torch.save(checkpoint, best_path)
-            self.logger.info(f"💾 New best model saved (loss: {self.best_val_loss:.6f})")
-        
-        # Keep only last 5 checkpoints to save space
-        self.cleanup_checkpoints()
-    
-    def cleanup_checkpoints(self):
-        """Keep only recent checkpoints to save space."""
-        checkpoints = list(self.checkpoint_dir.glob("checkpoint_step_*.pth"))
-        checkpoints.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        
-        # Keep last 5 + best model
-        for checkpoint in checkpoints[5:]:
-            try:
-                checkpoint.unlink()
-                self.logger.debug(f"Removed old checkpoint: {checkpoint}")
-            except Exception as e:
-                self.logger.warning(f"Failed to remove {checkpoint}: {e}")
+        try:
+            checkpoint = {
+                'global_step': self.global_step,
+                'epoch': self.epoch,
+                'best_val_loss': self.best_val_loss,
+                'model_state_dict': self.model.module.state_dict() if self.is_distributed else self.model.state_dict(),
+                'optimizer_state_dict': self.trainer.optimizer.state_dict(),
+                'scheduler_state_dict': self.trainer.scheduler.state_dict(),
+                'config': self.config.__dict__,
+                'pipeline_config': self.pipeline_config.__dict__
+            }
+            
+            # Save regular checkpoint
+            checkpoint_path = self.checkpoint_dir / f"checkpoint_step_{self.global_step}.pth"
+            torch.save(checkpoint, checkpoint_path)
+            
+            # Save best model
+            if is_best:
+                best_path = self.checkpoint_dir / "best_model.pth"
+                torch.save(checkpoint, best_path)
+                self.logger.info(f"New best model saved (loss: {self.best_val_loss:.6f})")
+            
+            # Keep only last 5 checkpoints to save space
+            self.cleanup_checkpoints()
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save checkpoint: {e}")
+            raise
+        finally:
+            # Synchronize all processes after checkpoint saving
+            if self.is_distributed:
+                dist.barrier()
+
+def cleanup_checkpoints(self):
+    """Keep only recent checkpoints to save space."""
+    checkpoints = list(self.checkpoint_dir.glob("checkpoint_step_*.pth"))
+    checkpoints.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    # Keep last 5 + best model
+    for checkpoint in checkpoints[5:]:
+        try:
+            checkpoint.unlink()
+            self.logger.debug(f"Removed old checkpoint: {checkpoint}")
+        except Exception as e:
+            self.logger.warning(f"Failed to remove {checkpoint}: {e}")
     
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch."""
@@ -410,15 +433,22 @@ class HPCTrainer:
                 
                 self.epoch += 1
                 
-                # Check memory usage
+                # Check memory usage and perform periodic cleanup
                 if self.global_step % 1000 == 0 and self.rank == 0:
                     memory = memory_usage()
                     self.logger.info(f"Memory usage: {memory}")
                     
-                    # Clear cache if needed
+                    # Always perform periodic cache cleanup to prevent memory leaks
+                    clear_cache()
+                    self.logger.info("Performed periodic GPU cache cleanup")
+                    
+                    # Additional cleanup if memory is high
                     if 'allocated' in memory and memory['allocated'] > 40:  # 40GB
+                        # Force garbage collection
+                        import gc
+                        gc.collect()
                         clear_cache()
-                        self.logger.info("Cleared GPU cache")
+                        self.logger.warning("High memory usage detected, performed aggressive cleanup")
         
         except KeyboardInterrupt:
             self.logger.info("Training interrupted by user")

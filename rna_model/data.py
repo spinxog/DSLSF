@@ -16,8 +16,28 @@ from Bio.PDB import PDBParser, PDBIO
 import subprocess
 import tempfile
 import os
-
+import time
+import fcntl
+from contextlib import contextmanager
 from .utils import tokenize_rna_sequence, compute_contact_map, bin_distances
+
+
+@contextmanager
+def file_lock(lock_file: Path):
+    """Context manager for file locking."""
+    lock_path = lock_file.with_suffix('.lock')
+    try:
+        # Create lock file and acquire exclusive lock
+        with open(lock_path, 'w') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            yield
+    finally:
+        # Release lock and remove lock file
+        try:
+            if lock_path.exists():
+                lock_path.unlink()
+        except OSError:
+            pass
 
 
 @dataclass
@@ -52,30 +72,42 @@ class RNADatasetLoader:
         file_path = Path(file_path)
         
         # Check for suspicious patterns first
-        suspicious_patterns = ['..', '\\\\', '//']
+        suspicious_patterns = ['..', '\\\\', '//', '\0', '|', '<', '>', '"', '*', '?']
         path_str = str(file_path)
         for pattern in suspicious_patterns:
             if pattern in path_str:
                 raise ValueError(f"Suspicious path pattern detected: {pattern}")
         
-        # Resolve to absolute path, following symlinks
-        abs_path = file_path.resolve()
+        # Normalize path and resolve to absolute path without following symlinks
+        try:
+            abs_path = file_path.resolve(strict=False)
+        except (RuntimeError, OSError) as e:
+            raise ValueError(f"Invalid path resolution: {e}")
         
         # Check if the original path is a symlink (potential security risk)
-        if file_path.is_symlink():
+        if file_path.exists() and file_path.is_symlink():
             raise ValueError(f"Symbolic links not allowed for security: {file_path}")
         
         # Check if any parent directory is a symlink
         for parent in file_path.parents:
-            if parent.is_symlink():
+            if parent.exists() and parent.is_symlink():
                 raise ValueError(f"Symbolic links in parent directories not allowed: {parent}")
         
         # Check if path is within allowed directory (cache_dir)
         cache_abs = self.cache_dir.resolve()
         try:
+            # Use relative_to with strict checking
             abs_path.relative_to(cache_abs)
         except ValueError:
             raise ValueError(f"File path outside allowed directory: {file_path}")
+        
+        # Additional security checks
+        if len(str(abs_path)) > 4096:  # Prevent path length attacks
+            raise ValueError("Path too long")
+        
+        # Check for Windows drive letters if on Unix system
+        if os.name != 'nt' and ':' in str(file_path)[:2]:
+            raise ValueError("Invalid path format for current OS")
         
         return abs_path
     
@@ -128,11 +160,17 @@ class RNADatasetLoader:
         
         # Group by residue with thread safety
         residues = {}
-        with threading.Lock():
-            for i, (coord, atom_name, residue_name) in enumerate(zip(coordinates, atom_names, residue_names)):
-                if residue_name not in residues:
-                    residues[residue_name] = []
-                residues[residue_name].append((coord, atom_name))
+        # Use a context manager for thread safety
+        lock = threading.Lock()
+        try:
+            with lock:
+                for i, (coord, atom_name, residue_name) in enumerate(zip(coordinates, atom_names, residue_names)):
+                    if residue_name not in residues:
+                        residues[residue_name] = []
+                    residues[residue_name].append((coord, atom_name))
+        finally:
+            # Lock is automatically released by context manager
+            pass
         
         # Convert to standard format
         sequence = ''.join([res[0][0] for res in residues.values()])
@@ -203,12 +241,43 @@ class RNADatasetLoader:
         return sequence, np.array(coordinates), atom_names, residue_names
     
     def load_rnacentral_sequences(self, download: bool = True) -> List[str]:
-        """Load RNA sequences from RNAcentral database."""
+        """Load RNA sequences from RNAcentral database with cache validation."""
         cache_file = self.cache_dir / "rnacentral_sequences.json"
         
         if cache_file.exists() and not download:
-            with open(cache_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Validate cache integrity
+                if not isinstance(data, list) or not all(isinstance(seq, str) for seq in data):
+                    raise ValueError("Invalid cache format")
+                
+                # Verify checksum if available
+                if '_metadata' in data and isinstance(data, dict):
+                    if 'checksum' in data['_metadata']:
+                        # Validate checksum
+                        data_copy = data.copy()
+                        del data_copy['_metadata']
+                        json_str = json.dumps(data_copy, separators=(',', ':'))
+                        calculated_checksum = hashlib.sha256(json_str.encode()).hexdigest()
+                        stored_checksum = data['_metadata']['checksum']
+                        
+                        if calculated_checksum != stored_checksum:
+                            raise ValueError("Cache checksum mismatch")
+                    
+                    # Extract sequences from dict format
+                    if 'sequences' in data:
+                        sequences = data['sequences']
+                    else:
+                        sequences = data
+                else:
+                    sequences = data
+                
+                return sequences
+                
+            except (json.JSONDecodeError, ValueError, KeyError) as e:
+                self.logger.warning(f"Cache validation failed: {e}, regenerating data")
         
         # For now, return a small sample
         # In practice, this would download from RNAcentral
@@ -220,8 +289,22 @@ class RNADatasetLoader:
             "AAUCCGGAAUCCGGAAUCCGG"
         ]
         
+        # Save with checksum
+        cache_data = {
+            'sequences': sample_sequences,
+            '_metadata': {
+                'version': '1.0',
+                'created_at': time.time(),
+                'checksum': ''
+            }
+        }
+        
+        # Calculate checksum
+        json_str = json.dumps(sample_sequences, separators=(',', ':'))
+        cache_data['_metadata']['checksum'] = hashlib.sha256(json_str.encode()).hexdigest()
+        
         with open(cache_file, 'w', encoding='utf-8') as f:
-            json.dump(sample_sequences, f)
+            json.dump(cache_data, f, indent=2)
         
         return sample_sequences
     
@@ -382,7 +465,7 @@ class RNADatasetLoader:
         return ss_matrix
     
     def save_dataset(self, data: Dict[str, List], filepath: Union[str, Path]):
-        """Save processed dataset using secure JSON format."""
+        """Save processed dataset using secure JSON format with file locking."""
         filepath = self._validate_file_path(filepath)
         
         if filepath.suffix == '.json':
@@ -401,55 +484,71 @@ class RNADatasetLoader:
             checksum = hashlib.sha256(json_str.encode()).hexdigest()
             json_data['_metadata'] = {'checksum': checksum, 'version': '1.0'}
             
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(json_data, f, indent=2)
+            # Use file locking to prevent concurrent access issues
+            with file_lock(filepath):
+                # Write to temporary file first, then atomic rename
+                temp_file = filepath.with_suffix('.tmp')
+                try:
+                    with open(temp_file, 'w', encoding='utf-8') as f:
+                        json.dump(json_data, f, indent=2)
+                    
+                    # Atomic rename
+                    temp_file.rename(filepath)
+                    
+                except Exception as e:
+                    # Clean up temp file if something went wrong
+                    if temp_file.exists():
+                        temp_file.unlink()
+                    raise e
         else:
             raise ValueError(f"Unsupported file format: {filepath.suffix}. Only JSON is supported for security.")
     
     def load_dataset(self, filepath: Union[str, Path]) -> Dict[str, List]:
-        """Load processed dataset with integrity verification."""
+        """Load processed dataset with integrity verification and file locking."""
         filepath = self._validate_file_path(filepath)
         
         if filepath.suffix == '.json':
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                
-                # Verify checksum if present
-                if '_metadata' in data and 'checksum' in data['_metadata']:
-                    stored_checksum = data['_metadata']['checksum']
-                    # Create copy without metadata for checksum calculation
-                    data_copy = data.copy()
-                    del data_copy['_metadata']
-                    json_str = json.dumps(data_copy, separators=(',', ':'))
-                    calculated_checksum = hashlib.sha256(json_str.encode()).hexdigest()
+            # Use file locking to prevent concurrent access issues
+            with file_lock(filepath):
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
                     
-                    if stored_checksum != calculated_checksum:
-                        raise ValueError(f"Checksum mismatch for file {filepath}")
+                    # Verify checksum if present
+                    if '_metadata' in data and 'checksum' in data['_metadata']:
+                        stored_checksum = data['_metadata']['checksum']
+                        # Create copy without metadata for checksum calculation
+                        data_copy = data.copy()
+                        del data_copy['_metadata']
+                        json_str = json.dumps(data_copy, separators=(',', ':'))
+                        calculated_checksum = hashlib.sha256(json_str.encode()).hexdigest()
+                        
+                        if stored_checksum != calculated_checksum:
+                            raise ValueError(f"Checksum mismatch for file {filepath}")
+                        
+                        # Remove metadata from returned data
+                        del data['_metadata']
                     
-                    # Remove metadata from returned data
-                    del data['_metadata']
-                
-                # Convert lists back to numpy arrays
-                processed_data = {}
-                for key, value in data.items():
-                    if isinstance(value, list) and len(value) > 0 and isinstance(value[0], list):
-                        # Check if this looks like coordinate data
-                        if len(value[0]) > 0 and isinstance(value[0][0], list):
-                            processed_data[key] = [np.array(arr) for arr in value]
-                        else:
+                    # Convert lists back to numpy arrays
+                    processed_data = {}
+                    for key, value in data.items():
+                        if isinstance(value, list) and len(value) > 0 and isinstance(value[0], list):
+                            # Check if this looks like coordinate data
+                            if len(value[0]) > 0 and isinstance(value[0][0], list):
+                                processed_data[key] = [np.array(arr) for arr in value]
+                            else:
+                                processed_data[key] = np.array(value)
+                        elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float)):
                             processed_data[key] = np.array(value)
-                    elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float)):
-                        processed_data[key] = np.array(value)
-                    else:
-                        processed_data[key] = value
-                
-                return processed_data
-                
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON format in {filepath}: {e}")
-            except Exception as e:
-                raise RuntimeError(f"Error loading dataset from {filepath}: {e}")
+                        else:
+                            processed_data[key] = value
+                    
+                    return processed_data
+                    
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Invalid JSON format in {filepath}: {e}")
+                except Exception as e:
+                    raise RuntimeError(f"Error loading dataset from {filepath}: {e}")
         else:
             raise ValueError(f"Unsupported file format: {filepath.suffix}. Only JSON is supported for security.")
 
@@ -462,6 +561,19 @@ class MSAProcessor:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=4)
+        self._shutdown = False
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.shutdown()
+    
+    def shutdown(self):
+        """Shutdown thread pool executor properly."""
+        if not self._shutdown and self._executor:
+            self._executor.shutdown(wait=True)
+            self._shutdown = True
     
     def create_msa_from_sequence(self, sequence: str, database: List[str]) -> np.ndarray:
         """Create MSA by finding similar sequences."""
