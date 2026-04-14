@@ -283,15 +283,15 @@ class RNASampler(nn.Module):
                     if step % 50 == 0:
                         self.logger.debug(f"Regular GPU cleanup at step {step}, memory usage: {memory_utilization:.2%}")
                 
-                # Additional cleanup for very large tensors
-                if step % 25 == 0:
-                    # Clean up any cached tensors that might be hanging around
-                    for obj in gc.get_objects():
-                        if isinstance(obj, torch.Tensor) and obj.is_cuda:
-                            try:
-                                del obj
-                            except:
-                                pass
+                # Additional cleanup for very large tensors - more efficient approach
+                if step % 100 == 0:  # Less frequent, more effective
+                    # Force garbage collection instead of iterating over all objects
+                    import gc
+                    gc.collect()
+                    # Additional GPU cleanup
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()  # Ensure all operations complete
             
             # Calculate current energy (simple approximation)
             current_energy = self._calculate_energy(coords, sequence)

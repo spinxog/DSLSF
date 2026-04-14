@@ -18,6 +18,18 @@ import time
 from contextlib import contextmanager
 from functools import wraps
 import asyncio
+
+# Platform-specific imports for file locking
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
 from ..core.utils import tokenize_rna_sequence, compute_contact_map, bin_distances
 from ..core.constants import BIOLOGICAL, GEOMETRY, COMPUTATIONAL, VALIDATION
 
@@ -113,83 +125,80 @@ def file_lock(lock_file: Path, timeout: float = None):
         if not lock.acquire(timeout=timeout):
             raise TimeoutError(f"Could not acquire thread lock for {lock_file}")
         
-        try:
-            # Create/open lock file for process-level locking with secure permissions
-            lock_fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-            
-            # Try to acquire file lock with timeout (cross-platform)
-            start_time = time.time()
-            
-            if os.name == 'posix':
-                # Unix/Linux systems use fcntl
-                import fcntl
-                while time.time() - start_time < timeout:
-                    try:
-                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        acquired = True
+        # Create/open lock file for process-level locking with secure permissions
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        
+        # Try to acquire file lock with timeout (cross-platform)
+        start_time = time.time()
+        
+        if os.name == 'posix' and fcntl is not None:
+            # Unix/Linux systems use fcntl
+            while time.time() - start_time < timeout:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except (OSError, IOError):
+                    if time.time() - start_time >= timeout:
                         break
-                    except IOError as e:
-                        if e.errno == 11:  # EAGAIN - would block
-                            time.sleep(0.1)  # Brief sleep before retry
-                        else:
-                            raise
-                else:
-                    raise TimeoutError(f"Could not acquire file lock for {lock_file} after {timeout}s")
-            else:
-                # Windows systems - use msvcrt or fallback
-                try:
-                    import msvcrt
-                    msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
-                    acquired = True
-                except (ImportError, IOError) as e:
-                    # Fallback to advisory file locking
-                    logging.warning(f"Windows file locking not available, using fallback: {e}")
-                    acquired = True
-            
-            if acquired:
-                # Write process ID and timestamp for debugging
-                lock_info = f"{os.getpid()}:{time.time()}".encode()
-                os.write(lock_fd, lock_info)
-                os.fsync(lock_fd)  # Ensure data is written to disk
-            
-            yield
-            
-        finally:
-            # Clean up file locks with comprehensive error handling
-            if lock_fd is not None:
-                try:
-                    # Release file lock based on OS
-                    if os.name == 'posix' and acquired:
-                        import fcntl
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)  # Release file lock
-                    elif os.name == 'nt' and acquired:
-                        try:
-                            import msvcrt
-                            msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
-                        except (ImportError, IOError):
-                            logging.warning("Windows file locking not available, using fallback")
-                    else:
-                        # No lock to release (not acquired)
-                        pass
-                except (OSError, IOError) as e:
-                    logging.error(f"Failed to release file lock: {e}")
-                finally:
-                    try:
-                        os.close(lock_fd)
-                    except (OSError, IOError) as e:
-                        logging.error(f"Failed to close file descriptor: {e}")
-            
-            # Always release thread lock with proper error handling
+                    time.sleep(0.1)
+        elif os.name == 'nt' and msvcrt is not None:
+            # Windows systems use msvcrt
             try:
-                lock.release()
-            except RuntimeError as e:
-                if "was never acquired" not in str(e).lower():
-                    logging.warning(f"Unexpected error releasing thread lock: {e}")
-                # Lock was not acquired by this thread - this is normal
-                pass
-            except Exception as e:
-                logging.error(f"Unexpected error in thread lock release: {e}")
-                pass
+                msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except (ImportError, IOError) as e:
+                logging.warning(f"Windows file locking not available: {e}")
+        else:
+            # Fallback for systems without proper file locking
+            logging.warning(f"File locking not available on {os.name}, using fallback")
+            acquired = True  # Assume success for compatibility
+        
+        if acquired:
+            # Write process ID and timestamp for debugging
+            lock_info = f"{os.getpid()}:{time.time()}".encode()
+            os.write(lock_fd, lock_info)
+            os.fsync(lock_fd)  # Ensure data is written to disk
+        
+        yield
+        
+    except Exception as e:
+        logging.error(f"Unexpected error in file lock context: {e}")
+        raise
+    finally:
+        # Clean up file locks with comprehensive error handling
+        if lock_fd is not None:
+            try:
+                # Release file lock based on OS
+                if os.name == 'posix' and acquired and fcntl is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)  # Release file lock
+                elif os.name == 'nt' and acquired and msvcrt is not None:
+                    try:
+                        msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+                    except (ImportError, IOError):
+                        logging.warning("Windows file locking not available, using fallback")
+                else:
+                    # No lock to release (not acquired or not available)
+                    pass
+            except (OSError, IOError) as e:
+                logging.error(f"Failed to release file lock: {e}")
+            finally:
+                try:
+                    os.close(lock_fd)
+                except (OSError, IOError) as e:
+                    logging.error(f"Failed to close file descriptor: {e}")
+        
+        # Always release thread lock with proper error handling
+        try:
+            lock.release()
+        except RuntimeError as e:
+            if "was never acquired" not in str(e).lower():
+                logging.warning(f"Unexpected error releasing thread lock: {e}")
+            # Lock was not acquired by this thread - this is normal
+            pass
+        except Exception as e:
+            logging.error(f"Unexpected error in thread lock release: {e}")
+            pass
         
         # Clean up lock file
         try:
