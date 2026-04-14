@@ -1,6 +1,6 @@
 # RNA 3D Folding Pipeline
 
-A state-of-the-art end-to-end neural pipeline for RNA 3D structure prediction, inspired by recent advances in protein folding and tailored specifically for RNA molecules.
+An end-to-end neural pipeline for RNA 3D structure prediction, inspired by recent advances in protein folding and tailored specifically for RNA molecules.
 
 ## Overview
 
@@ -63,9 +63,6 @@ from rna_model import RNAFoldingPipeline, PipelineConfig
 config = PipelineConfig()
 pipeline = RNAFoldingPipeline(config)
 
-# Enable competition mode
-pipeline.enable_competition_mode()
-
 # Predict structure for a single sequence
 sequence = "GGGAAAUCCGCCUUGGCAAC"
 result = pipeline.predict_single_sequence(sequence)
@@ -90,7 +87,7 @@ The pipeline is optimized for the 8-hour notebook constraint:
 - **Inference time**: <144s per sequence (200 sequences in 8h)
 - **Memory usage**: <8GB GPU peak
 - **Bundle size**: <=15GB compressed artifacts
-- **Accuracy**: Best-of-5 TM-score competitive with state-of-the-art
+- **Accuracy**: Best-of-5 TM-score competitive with existing methods
 
 ## Advanced Features
 

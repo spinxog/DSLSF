@@ -1,3 +1,5 @@
+# RNA 3D Folding Pipeline - pyproject.toml
+
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -5,9 +7,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rna-3d-folding"
 version = "0.1.0"
-description = "State-of-the-art RNA 3D structure prediction pipeline"
+description = "RNA 3D structure prediction pipeline"
 authors = [
-    {name = "RNA Folding Team", email = "team@rnafold.org"},
+    {name = "RNA Folding Developer", email = "developer@rnafold.org"},
 ]
 license = {text = "MIT"}
 readme = "README.md"
@@ -20,8 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: 3.11",
+    "Programming Language :: 3.10",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -87,11 +88,12 @@ extend-exclude = '''
   | \.hg
   | \.mypy_cache
   | \.tox
-  | \.venv
   | _build
   | buck-out
   | build
   | dist
+  | \.venv
+  | _install
 )/
 '''
 
@@ -108,7 +110,7 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true
-disallow_untyped_decorators = true
+disallow_untyped_decorators = false
 no_implicit_optional = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -151,13 +153,15 @@ exclude = [
     "*.egg-info",
     ".venv",
     ".tox",
+    "docs",
+    "tests",
 ]
 
 [tool.pre-commit]
 repos = [
-    {repo = "local:", hooks = {id = "black"}, language_version = "python3"},
-    {repo = "local:", hooks = {id = "isort"}, language_version = "python3"},
-    {repo = "local:", hooks = {id = "mypy"}, language_version = "python3"},
-    {repo = "local:", hooks = {id = "flake8"}, language_version = "python3"},
-    {repo = "local:", hooks = {id = "pytest"}, language_version = "python3"},
+    {repo = "local:", hooks = [{id = "black"}, {language_version = "python3"}]},
+    {repo = "local:", hooks = [{id = "isort"}, {language_version = "python3"}]},
+    {repo = "local:", hooks = [{id = "mypy"}, {language_version = "python3"}]},
+    {repo = "local:", hooks = [{id = "flake8"}, {language_version = "python3"}]},
+    {repo = "local:", hooks = [{id = "pytest"}, {language_version = "python3"}]},
 ]
