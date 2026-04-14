@@ -7,17 +7,17 @@ import torch.nn as nn
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
-from .language_model import RNALanguageModel
-from .secondary_structure import SecondaryStructurePredictor
-from .structure_encoder import StructureEncoder
+from ..models.language_model import RNALanguageModel
+from ..models.secondary_structure import SecondaryStructurePredictor
+from ..models.structure_encoder import StructureEncoder
 from .geometry_module import GeometryModule
 from .sampler import RNASampler, SamplerConfig
 from .refinement import GeometryRefiner
 from .config import GlobalConfig, get_config, validate_config
 from .logging_config import setup_logging, StructuredLogger
-from .data import RNADatasetLoader, RNAStructure
-from .training import Trainer, TrainingConfig
-from .evaluation import StructureEvaluator, EvaluationMetrics
+from ..data import DatasetManager, RNAStructure
+from ..training import Trainer, TrainingConfig
+from ..evaluation import StructureEvaluator, EvaluationMetrics
 from .utils import (
     compute_tm_score, compute_rmsd, superimpose_coordinates,
     compute_contact_map, bin_distances, mask_sequence,

@@ -3,7 +3,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Tuple, Union
+from typing import Union, Optional, Tuple, Dict
+from ..core.utils import compute_contact_map, compute_rmsd
 from dataclasses import dataclass
 import math
 import hashlib

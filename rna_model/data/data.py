@@ -18,7 +18,7 @@ import time
 from contextlib import contextmanager
 from functools import wraps
 import asyncio
-from .utils import tokenize_rna_sequence, compute_contact_map, bin_distances
+from ..core.utils import tokenize_rna_sequence, compute_contact_map, bin_distances
 
 
 def retry_on_io_error(max_retries: int = 3, delay: float = 1.0):

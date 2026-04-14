@@ -7,8 +7,8 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 
-from .utils import compute_tm_score, compute_rmsd, superimpose_coordinates
-from .data import RNAStructure
+from ..core.utils import compute_tm_score, compute_rmsd, superimpose_coordinates
+from ..data import RNAStructure
 
 
 @dataclass

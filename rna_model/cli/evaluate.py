@@ -8,11 +8,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..pipeline import RNAFoldingPipeline, PipelineConfig
+from ..core import RNAFoldingPipeline, PipelineConfig, setup_logging, get_config
 from ..evaluation import StructureEvaluator
 from ..data import RNADatasetLoader
-from ..logging_config import setup_logger
-from ..config import get_config
 
 
 def evaluate_command():

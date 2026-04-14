@@ -7,9 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..pipeline import RNAFoldingPipeline, PipelineConfig
-from ..logging_config import setup_logger
-from ..config import get_config
+from ..core import RNAFoldingPipeline, PipelineConfig, setup_logging, get_config
 
 
 def predict_command():

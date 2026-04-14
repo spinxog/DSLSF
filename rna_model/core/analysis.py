@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import logging
 
 from .experiment import ExperimentManager
-from .evaluation import EvaluationMetrics
+from ..evaluation import EvaluationMetrics
 from .utils import compute_tm_score, compute_rmsd
 
 

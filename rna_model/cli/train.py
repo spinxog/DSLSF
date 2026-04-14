@@ -7,11 +7,9 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from ..pipeline import RNAFoldingPipeline, PipelineConfig
+from ..core import RNAFoldingPipeline, PipelineConfig, setup_logging, get_config
 from ..training import Trainer, TrainingConfig
 from ..data import RNADatasetLoader, RNAStructure
-from ..logging_config import setup_logger
-from ..config import get_config
 
 
 def train_command():

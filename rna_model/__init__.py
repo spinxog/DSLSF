@@ -1,48 +1,82 @@
-"""RNA 3D Folding Pipeline - Core Architecture"""
+"""RNA 3D Folding Pipeline - Modular Architecture"""
 
-from .language_model import RNALanguageModel
-from .secondary_structure import SecondaryStructurePredictor
-from .structure_encoder import StructureEncoder
-from .geometry_module import GeometryModule
-from .sampler import RNASampler, PerformanceMetrics
-from .refinement import GeometryRefiner
-from .pipeline import RNAFoldingPipeline, PipelineConfig
-from .config import GlobalConfig, get_config, validate_config
-from .logging_config import setup_logging, StructuredLogger, TrainingLogger
-from .utils import tokenize_rna_sequence, compute_contact_map, bin_distances
-from .experiment import ExperimentManager, ExperimentConfig, ExperimentResults, create_experiment_config, log_training_results
-from .dataset import DatasetManager, DatasetInfo, register_pdb_dataset, create_train_val_test_split
-from .optimization import HyperparameterTuner, HyperparameterSpace, quick_hyperparameter_search, comprehensive_hyperparameter_search
-from .analysis import ResultAnalyzer, AnalysisConfig, analyze_experiment_results, compare_experiment_results, analyze_dataset_performance, generate_analysis_report
+# Core pipeline and utilities
+from .core import (
+    RNAFoldingPipeline, PipelineConfig, GlobalConfig, get_config, validate_config,
+    setup_logging, StructuredLogger, compute_tm_score, compute_rmsd, superimpose_coordinates,
+    compute_contact_map, bin_distances, mask_sequence, set_seed, clear_cache, memory_usage,
+    GeometryModule, RigidTransform, RNASampler, SamplerConfig, PerformanceMetrics,
+    GeometryRefiner
+)
+
+# Neural network models
+from .models import (
+    RNALanguageModel, masked_span_loss, contact_loss,
+    SecondaryStructurePredictor, secondary_structure_loss,
+    StructureEncoder, Trainer, TrainingConfig,
+    StructureEvaluator, EvaluationMetrics
+)
+
+# Data handling
+from .data import DatasetManager, RNAStructure
+
+# Analysis and optimization tools
+from .core.analysis import ResultAnalyzer, AnalysisConfig, analyze_experiment_results, compare_experiment_results, analyze_dataset_performance, generate_analysis_report
+from .core.experiment import ExperimentManager, ExperimentConfig, ExperimentResults, create_experiment_config, log_training_results
+from .core.optimization import HyperparameterTuner, HyperparameterSpace, quick_hyperparameter_search, comprehensive_hyperparameter_search
 
 __version__ = "0.1.0"
 __all__ = [
-    "RNALanguageModel",
-    "SecondaryStructurePredictor", 
-    "StructureEncoder",
-    "GeometryModule",
-    "RNASampler",
-    "PerformanceMetrics",
-    "GeometryRefiner",
+    # Core pipeline
     "RNAFoldingPipeline",
     "PipelineConfig",
-    "IntegratedModel",
     "GlobalConfig",
     "get_config",
     "validate_config",
-    "setup_logger",
+    "setup_logging",
     "StructuredLogger",
-    "TrainingLogger",
-    "PerformanceLogger",
+    
+    # Models
+    "RNALanguageModel",
+    "SecondaryStructurePredictor",
+    "StructureEncoder",
+    "GeometryModule",
+    "RNASampler",
+    "SamplerConfig",
+    "PerformanceMetrics",
+    "GeometryRefiner",
+    "Trainer",
+    "TrainingConfig",
+    "StructureEvaluator",
+    "EvaluationMetrics",
+    
+    # Data
+    "DatasetManager",
+    "RNAStructure",
+    
+    # Utilities
+    "compute_tm_score",
+    "compute_rmsd",
+    "superimpose_coordinates",
+    "compute_contact_map",
+    "bin_distances",
+    "mask_sequence",
+    "set_seed",
+    "clear_cache",
+    "memory_usage",
+    "RigidTransform",
+    
+    # Loss functions
+    "masked_span_loss",
+    "contact_loss",
+    "secondary_structure_loss",
+    
+    # Analysis and optimization
     "ExperimentManager",
     "ExperimentConfig",
     "ExperimentResults",
     "create_experiment_config",
     "log_training_results",
-    "DatasetManager",
-    "DatasetInfo",
-    "register_pdb_dataset",
-    "create_train_val_test_split",
     "HyperparameterTuner",
     "HyperparameterSpace",
     "quick_hyperparameter_search",
@@ -53,13 +87,4 @@ __all__ = [
     "compare_experiment_results",
     "analyze_dataset_performance",
     "generate_analysis_report",
-    "RNAFoldingPipeline",
-    "PipelineConfig",
-    "IntegratedModel",
-    "GlobalConfig",
-    "get_config",
-    "validate_config",
-    "setup_logger",
-    "StructuredLogger",
-    "PerformanceLogger",
 ]

@@ -10,11 +10,11 @@ from dataclasses import dataclass
 import time
 from pathlib import Path
 
-from .language_model import RNALanguageModel, masked_span_loss, contact_loss
-from .secondary_structure import SecondaryStructurePredictor, secondary_structure_loss
-from .geometry_module import GeometryModule, geometry_loss, fape_loss
+from ..models.language_model import RNALanguageModel, masked_span_loss, contact_loss
+from ..models.secondary_structure import SecondaryStructurePredictor, secondary_structure_loss
+from ..core.geometry_module import GeometryModule, geometry_loss, fape_loss
 # Import PipelineConfig locally to avoid circular imports
-from .utils import set_seed, clear_cache, memory_usage
+from ..core.utils import set_seed, clear_cache, memory_usage
 import json
 
 

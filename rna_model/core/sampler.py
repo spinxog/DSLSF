@@ -463,9 +463,19 @@ class RNASampler(nn.Module):
             diff = rep_coords.unsqueeze(2) - rep_coords.unsqueeze(1)  # (batch_size, seq_len, seq_len, 3)
             distances = torch.norm(diff, dim=-1)  # (batch_size, seq_len, seq_len)
             
-        # Set diagonal to 0
-        batch_indices = torch.arange(seq_len, device=coords.device)
-        contact_map[:, batch_indices, batch_indices] = 0.0
+            # Create contact map (threshold-based)
+            contact_threshold = self.config.contact_threshold
+            contact_map = (distances < contact_threshold).float()
+            
+            # Set diagonal to 0
+            batch_indices = torch.arange(seq_len, device=coords.device)
+            contact_map[:, batch_indices, batch_indices] = 0.0
+        
+        # Ensure contact_map is defined for cached case too
+        if cached_contact_map is None:
+            # Set diagonal to 0 for cached case as well
+            batch_indices = torch.arange(seq_len, device=coords.device)
+            contact_map[:, batch_indices, batch_indices] = 0.0
             
         # Clean up computation tensors
         del rep_coords, diff, batch_indices
