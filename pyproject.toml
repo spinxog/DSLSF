@@ -22,7 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
-    "Programming Language :: 3.10",
+    "Programming Language :: Python :: 3.10",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -70,7 +70,7 @@ rna_model = [
     "configs/*.yaml",
 ]
 
-[tool.setuptools.entry-points."console_scripts]
+[tool.setuptools.entry-points."console_scripts"]
 rna-predict = "rna_model.cli.predict:predict_command"
 rna-train = "rna_model.cli.train:train_command"
 rna-evaluate = "rna_model.cli.evaluate:evaluate_command"

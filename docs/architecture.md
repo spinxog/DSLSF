@@ -28,9 +28,9 @@ Input Sequence
 +-------------------+
        |
        v
-+-------------------+
++-----------------+
 | Geometry Module   |  (SE(3)-equivariant)
-+-------------------+
++-----------------+
        |
        v
 +-------------+
@@ -170,31 +170,16 @@ Training Data
 +--------------+    +-------------------+
 | Tokenization | -> | Data Augmentation |
 +--------------+    +-------------------+
-     |
-     v
-+--------------+    +-------------------+
 | Language Model| -> | Contact Prediction |
 +--------------+    +-------------------+
-     |
-     v
-+-------------------+    +-----------------+
 | Secondary Structure| -> | Hypothesis Sampling |
-+-------------------+    +-----------------+
-     |
-     v
-+----------------+    +-----------------+
++--------------+    +-------------------+
 | Structure Encoder| -> | Sparse Attention |
-+----------------+    +-----------------+
-     |
-     v
-+----------------+    +-----------------+
-| Geometry Module | -> | IPA Operations |
-+----------------+    +-----------------+
-     |
-     v
-+-------------+    +----------------+
-|   Loss      | <- | Multi-task Loss |
-+-------------+    +----------------+
++--------------+    +-------------------+
+| Geometry Module| -> | IPA Operations |
++--------------+    +-----------------+
+|    Loss      | <- | Multi-task Loss |
++--------------+    +-----------------+
 ```
 
 ### Inference Pipeline
@@ -203,43 +188,28 @@ Training Data
 Input Sequence
      |
      v
-+--------------+    +-----------------+
++--------------+    +-------------------+
 | Tokenization | -> | Cached Embeddings |
-+--------------+    +-----------------+
-     |
-     v
-+----------------+    +-----------------+
++--------------+    +-------------------+
 | Language Model| -> | Embedding Lookup |
-+----------------+    +-----------------+
-     |
-     v
-+-------------------+    +-----------------+
++--------------+    +-------------------+
++-------------------+    +-------------------+
 | Secondary Structure| -> | Top-k Hypotheses |
++-------------------+    +-------------------+
 +-------------------+    +-----------------+
-     |
-     v
-+----------------+    +-----------------+
 | Structure Encoder| -> | Sparse Processing |
-+----------------+    +-----------------+
-     |
-     v
-+----------------+    +-----------------+
-| Geometry Module | -> | Coordinate Prediction |
-+----------------+    +-----------------+
-     |
-     v
++-------------------+    +-----------------+
++-------------------+    +-----------------+
+| Geometry Module| -> | Coordinate Prediction |
++-------------------+    +-----------------+
 +-------------+    +-----------------+
 |   Sampler   | <- | Diverse Sampling |
 +-------------+    +-----------------+
-     |
-     v
 +-------------+    +-----------------+
 |  Refiner    | <- | Fast Optimization |
 +-------------+    +-----------------+
-     |
-     v
 +-----------------+
-| 5 Best Decoys |
++ 5 Best Decoys |
 +-----------------+
 ```
 
@@ -251,6 +221,7 @@ Each component is independently designed and can be:
 - Replaced with alternative implementations
 - Trained separately
 - Optimized for specific hardware
+- Extended with additional features
 
 ### 2. Scalability
 
@@ -258,6 +229,7 @@ The architecture supports:
 - Long sequences (>200nt) through sparse attention
 - Batch processing with memory management
 - Distributed training across multiple GPUs
+- Competition deployment with time constraints
 
 ### 3. Competition Optimization
 
@@ -289,6 +261,7 @@ Robust mathematical operations:
 1. **Efficient Data Loading**: Streaming data processing
 2. **Cache Management**: LRU cache with size limits
 3. **Batch Processing**: Optimal batch sizes for hardware
+4. **Streaming**: Process data in chunks
 
 ## Error Handling
 
@@ -321,10 +294,11 @@ Input validation at each stage:
 - **Base model**: ~2-4GB GPU memory
 - **With sparse attention**: ~4-6GB GPU memory
 - **Batch processing**: Scales linearly with batch size
+- **Competition**: <8GB GPU memory limit
 
 ### Accuracy Metrics
 
-- **TM-score**: Competitive with state-of-the-art methods
+- **TM-score**: Competitive with existing methods
 - **RMSD**: Typically <3Å for well-behaved sequences
 - **GDT-TS**: >0.5 for most test cases
 
@@ -370,6 +344,7 @@ Flexible configuration system:
 2. **MSA Processing**: Evolutionary information incorporation
 3. **Energy Functions**: Physics-based scoring
 4. **Web Interface**: User-friendly prediction service
+- **Clinical Applications**: Disease-associated variant prediction
 
 ### Research Directions
 

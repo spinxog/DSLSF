@@ -206,7 +206,7 @@ metrics = comp_eval.evaluate_competition_submission(
 
 # Create leaderboard entry
 entry = comp_eval.create_leaderboard_entry(
-    team_name="RNA_Fold_Team",
+    participant_name="RNA_Fold_Participant",
     submission_coords=submission_array,
     true_coords=true_array,
     sequence_lengths=lengths
