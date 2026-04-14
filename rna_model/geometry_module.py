@@ -28,7 +28,10 @@ class RigidTransform:
     
     @staticmethod
     def quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
-        """Convert quaternions to rotation matrices."""
+        """Convert quaternions to rotation matrices with proper normalization."""
+        # Normalize quaternions first (critical for valid rotation matrices)
+        quaternions = quaternions / (torch.norm(quaternions, dim=-1, keepdim=True) + 1e-8)
+        
         w, x, y, z = quaternions.unbind(-1)
         
         xx, yy, zz = x*x, y*y, z*z
@@ -78,7 +81,7 @@ class RigidTransform:
         mask1 = trace > 0
         if mask1.any():
             s = 0.5 / torch.sqrt(trace[mask1] + 1.0)
-            q_w[mask1] = 0.25 / s
+            q_w[mask1] = 0.25 / s  # Correct: w = 0.25/s, not s/4
             q_x[mask1] = (matrices[mask1, 2, 1] - matrices[mask1, 1, 2]) * s
             q_y[mask1] = (matrices[mask1, 0, 2] - matrices[mask1, 2, 0]) * s
             q_z[mask1] = (matrices[mask1, 1, 0] - matrices[mask1, 0, 1]) * s

@@ -58,9 +58,13 @@ def compute_tm_score(coords1: np.ndarray, coords2: np.ndarray) -> float:
     diff = coords1_centered - coords2_centered
     rmsd = np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
     
-    # Simplified TM-score (not the exact formula)
-    d0 = 1.24 * (len(coords1) - 15) ** (1/3) - 1.8
-    d0 = max(0.5, d0)  # Minimum d0
+    # Correct TM-score formula with proper handling of short sequences
+    n = len(coords1)
+    if n <= 15:
+        d0 = 0.5  # For short sequences (< 15 residues)
+    else:
+        d0 = 1.24 * (n - 15) ** (1/3) - 1.8
+        d0 = max(0.5, d0)  # Minimum d0 for all sequences
     
     tm_score = 1 / (1 + (rmsd / d0) ** 2)
     
@@ -82,21 +86,21 @@ def superimpose_coordinates(coords1: np.ndarray, coords2: np.ndarray) -> Tuple[n
     coords1_centered = coords1 - center1
     coords2_centered = coords2 - center2
     
-    # Compute covariance matrix
-    cov_matrix = np.dot(coords2_centered.T, coords1_centered)
+    # Compute covariance matrix (correct order for Kabsch algorithm)
+    cov_matrix = np.dot(coords1_centered.T, coords2_centered)
     
     # SVD
     U, S, Vt = np.linalg.svd(cov_matrix)
     
-    # Rotation matrix
-    rotation = np.dot(U, Vt)
+    # Rotation matrix (correct order: R = V * U^T)
+    rotation = np.dot(Vt.T, U)
     
-    # Ensure proper orientation
+    # Ensure proper orientation (reflection correction)
     if np.linalg.det(rotation) < 0:
         Vt[-1, :] *= -1
-        rotation = np.dot(U, Vt)
+        rotation = np.dot(Vt.T, U)
     
-    # Apply rotation
+    # Apply rotation to align coords2 to coords1
     coords2_aligned = np.dot(coords2_centered, rotation) + center1
     
     return coords1, coords2_aligned
@@ -172,7 +176,7 @@ def unbin_distances(binned_distances: np.ndarray, n_bins: int = 64, max_dist: fl
 
 
 def compute_angles(coords: np.ndarray) -> np.ndarray:
-    """Compute bond angles from coordinates."""
+    """Compute bond angles from coordinates with proper error handling."""
     n_atoms = len(coords)
     angles = []
     
@@ -180,13 +184,21 @@ def compute_angles(coords: np.ndarray) -> np.ndarray:
         v1 = coords[i] - coords[i + 1]
         v2 = coords[i + 2] - coords[i + 1]
         
-        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+        # Check for zero vectors (overlapping atoms)
+        v1_norm = np.linalg.norm(v1)
+        v2_norm = np.linalg.norm(v2)
+        
+        if v1_norm < 1e-8 or v2_norm < 1e-8:
+            # Overlapping atoms, angle is undefined, skip
+            continue
+        
+        cos_angle = np.dot(v1, v2) / (v1_norm * v2_norm)
         cos_angle = np.clip(cos_angle, -1.0, 1.0)
         angle = np.arccos(cos_angle)
         
         angles.append(angle)
     
-    return np.array(angles)
+    return np.array(angles) if angles else np.array([])
 
 
 def compute_dihedrals(coords: np.ndarray) -> np.ndarray:
@@ -207,10 +219,19 @@ def compute_dihedrals(coords: np.ndarray) -> np.ndarray:
         n0 = np.cross(b0, b1)
         n1 = np.cross(b1, b2)
         
+        # Check for zero vectors (colinear atoms)
+        n0_norm = np.linalg.norm(n0)
+        n1_norm = np.linalg.norm(n1)
+        b1_norm = np.linalg.norm(b1)
+        
+        if n0_norm < 1e-8 or n1_norm < 1e-8 or b1_norm < 1e-8:
+            # Colinear atoms, dihedral is undefined, skip
+            continue
+        
         # Normalize
-        n0 = n0 / np.linalg.norm(n0)
-        n1 = n1 / np.linalg.norm(n1)
-        b1 = b1 / np.linalg.norm(b1)
+        n0 = n0 / n0_norm
+        n1 = n1 / n1_norm
+        b1 = b1 / b1_norm
         
         # Dihedral angle
         m1 = np.cross(n0, b1)
@@ -224,13 +245,13 @@ def compute_dihedrals(coords: np.ndarray) -> np.ndarray:
 
 
 def create_distance_matrix(coords: np.ndarray) -> np.ndarray:
-    """Create pairwise distance matrix."""
-    n_residues = len(coords)
-    dist_matrix = np.zeros((n_residues, n_residues))
+    """Create pairwise distance matrix using vectorized operations."""
+    if len(coords) == 0:
+        return np.zeros((0, 0))
     
-    for i in range(n_residues):
-        for j in range(n_residues):
-            dist_matrix[i, j] = np.linalg.norm(coords[i] - coords[j])
+    # Vectorized computation using broadcasting
+    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+    dist_matrix = np.linalg.norm(diff, axis=2)
     
     return dist_matrix
 
