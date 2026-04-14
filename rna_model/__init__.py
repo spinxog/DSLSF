@@ -13,7 +13,7 @@ from .core import (
 from .models import (
     RNALanguageModel, masked_span_loss, contact_loss,
     SecondaryStructurePredictor, secondary_structure_loss,
-    StructureEncoder, Trainer, TrainingConfig,
+    StructureEncoder, IntegratedModel, Trainer, TrainingConfig,
     StructureEvaluator, EvaluationMetrics
 )
 
@@ -40,6 +40,7 @@ __all__ = [
     "RNALanguageModel",
     "SecondaryStructurePredictor",
     "StructureEncoder",
+    "IntegratedModel",
     "GeometryModule",
     "RNASampler",
     "SamplerConfig",

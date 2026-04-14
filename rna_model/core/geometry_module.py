@@ -7,6 +7,11 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import math
 import logging
+import threading
+from functools import lru_cache
+import hashlib
+
+from .constants import BIOLOGICAL, GEOMETRY, COMPUTATIONAL, MODEL
 
 
 @dataclass
@@ -17,21 +22,94 @@ class GeometryConfig:
     n_layers: int = 4
     d_ff: int = 1024
     dropout: float = 0.1
-    n_atoms_per_residue: int = 3  # P, C4', N1 (simplified representation)
-    distance_bins: int = 64
-    angle_bins: int = 36
-    torsion_bins: int = 72
-    MAX_ROTATION_MATRIX_VALUE = 10.0
+    n_atoms_per_residue: int = BIOLOGICAL.N_ATOMS_PER_RESIDUE
+    distance_bins: int = MODEL.DEFAULT_DISTANCE_BINS
+    angle_bins: int = MODEL.DEFAULT_ANGLE_BINS
+    torsion_bins: int = MODEL.DEFAULT_TORSION_BINS
+    MAX_ROTATION_MATRIX_VALUE: GEOMETRY.ROTATION_MATRIX_MAX_VALUE
 
 
 class RigidTransform:
-    """Rigid transformation utilities for 3D coordinates."""
+    """Rigid transformation utilities for 3D coordinates with improved caching."""
+    
+    # Class-level cache with proper management
+    _quaternion_cache = {}
+    _cache_lock = threading.RLock()
+    _max_cache_size = COMPUTATIONAL.DEFAULT_CACHE_ENTRIES
+    _cache_hits = 0
+    _cache_misses = 0
+    
+    @classmethod
+    def _get_cache_key(cls, quaternions: torch.Tensor) -> str:
+        """Generate a robust cache key for quaternions."""
+        # Move tensor to CPU for numpy conversion
+        if quaternions.is_cuda:
+            quaternions_cpu = quaternions.cpu()
+        else:
+            quaternions_cpu = quaternions
+        
+        # Round to reduce floating point precision issues
+        rounding_factor = 1e6
+        rounded = torch.round(quaternions_cpu * rounding_factor) / rounding_factor
+        
+        # Include tensor metadata in hash for better uniqueness
+        metadata = f"{quaternions_cpu.shape}_{quaternions_cpu.dtype}_{quaternions_cpu.device}"
+        
+        # Use SHA256 instead of MD5 for better collision resistance
+        combined_data = rounded.flatten().numpy().tobytes() + metadata.encode()
+        return hashlib.sha256(combined_data).hexdigest()
+    
+    @classmethod
+    def _cleanup_cache(cls):
+        """Clean up cache to prevent memory leaks."""
+        if len(cls._quaternion_cache) > cls._max_cache_size:
+            # Remove oldest entries (simple FIFO)
+            keys_to_remove = list(cls._quaternion_cache.keys())[:len(cls._quaternion_cache) // 2]
+            for key in keys_to_remove:
+                del cls._quaternion_cache[key]
+    
+    @classmethod
+    def _cached_quaternion_to_matrix(cls, quaternions: torch.Tensor) -> Optional[torch.Tensor]:
+        """Cached quaternion to matrix conversion with proper validation."""
+        cache_key = cls._get_cache_key(quaternions)
+        
+        with cls._cache_lock:
+            if cache_key in cls._quaternion_cache:
+                cls._cache_hits += 1
+                # Return a copy to prevent modification
+                return cls._quaternion_cache[cache_key].clone()
+            
+            cls._cache_misses += 1
+            
+            # Compute matrix
+            try:
+                matrix = cls._compute_quaternion_to_matrix(quaternions)
+                
+                # Validate result before caching
+                if cls._validate_rotation_matrix(matrix):
+                    # Cache cleanup if needed
+                    cls._cleanup_cache()
+                    
+                    # Store in cache
+                    cls._quaternion_cache[cache_key] = matrix.clone()
+                    return matrix
+                else:
+                    logging.warning("Invalid rotation matrix generated, not caching")
+                    return matrix
+                    
+            except Exception as e:
+                logging.error(f"Quaternion to matrix conversion failed: {e}")
+                raise
     
     @staticmethod
-    def quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
-        """Convert quaternions to rotation matrices with proper normalization."""
+    def _compute_quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
+        """Core quaternion to matrix computation without caching."""
+        # Validate quaternion values
+        if torch.isnan(quaternions).any() or torch.isinf(quaternions).any():
+            raise ValueError("Invalid quaternion values: NaN or Inf detected")
+        
         # Normalize quaternions first (critical for valid rotation matrices)
-        quaternions = quaternions / (torch.norm(quaternions, dim=-1, keepdim=True) + 1e-8)
+        quaternions = quaternions / (torch.norm(quaternions, dim=-1, keepdim=True) + GEOMETRY.QUATERNION_NORMALIZATION_EPSILON)
         
         w, x, y, z = quaternions.unbind(-1)
         
@@ -43,9 +121,78 @@ class RigidTransform:
             1 - 2*(yy + zz), 2*(xy - wz), 2*(xz + wy),
             2*(xy + wz), 1 - 2*(xx + zz), 2*(yz - wx),
             2*(xz - wy), 2*(yz + wx), 1 - 2*(xx + yy)
-        ], dim=-1).view(*quaternions.shape[:-1], 3, 3)
+        ], dim=-1)
         
         return matrix
+    
+    @staticmethod
+    def _validate_rotation_matrix(matrix: torch.Tensor) -> bool:
+        """Validate rotation matrix properties."""
+        try:
+            # Check shape
+            if matrix.shape[-2:] != (3, 3):
+                return False
+            
+            # Check for NaN or Inf
+            if torch.isnan(matrix).any() or torch.isinf(matrix).any():
+                return False
+            
+            # Check determinant (should be close to 1)
+            det = torch.det(matrix)
+            if torch.any(torch.abs(det - 1.0) > 1e-5):
+                return False
+            
+            # Check orthogonality: R @ R.T should be identity
+            batch_shape = matrix.shape[:-2]
+            identity = torch.eye(3, device=matrix.device, dtype=matrix.dtype)
+            identity = identity.expand(*batch_shape, 3, 3)
+            
+            product = torch.matmul(matrix, matrix.transpose(-2, -1))
+            if torch.any(torch.abs(product - identity) > 1e-5):
+                return False
+            
+            return True
+            
+        except Exception:
+            return False
+    
+    @classmethod
+    def get_cache_stats(cls) -> Dict[str, Any]:
+        """Get cache statistics."""
+        with cls._cache_lock:
+            total_requests = cls._cache_hits + cls._cache_misses
+            hit_rate = cls._cache_hits / total_requests if total_requests > 0 else 0.0
+            
+            return {
+                'cache_size': len(cls._quaternion_cache),
+                'max_size': cls._max_cache_size,
+                'hits': cls._cache_hits,
+                'misses': cls._cache_misses,
+                'hit_rate': hit_rate
+            }
+    
+    @classmethod
+    def clear_cache(cls):
+        """Clear the quaternion cache."""
+        with cls._cache_lock:
+            cls._quaternion_cache.clear()
+            cls._cache_hits = 0
+            cls._cache_misses = 0
+    
+    @staticmethod
+    def quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
+        """Convert quaternions to rotation matrices with improved caching."""
+        # Use cache for reasonable batch sizes
+        if quaternions.numel() <= COMPUTATIONAL.QUATERNION_CACHE_BATCH_THRESHOLD:
+            try:
+                cached_result = RigidTransform._cached_quaternion_to_matrix(quaternions)
+                if cached_result is not None:
+                    return cached_result.view(*quaternions.shape[:-1], 3, 3)
+            except Exception as e:
+                logging.warning(f"Cache retrieval failed: {e}, computing directly")
+        
+        # Direct computation for large batches or cache misses
+        return RigidTransform._compute_quaternion_to_matrix(quaternions)
     
     @staticmethod
     def matrix_to_quaternion(matrices: torch.Tensor) -> torch.Tensor:
@@ -81,38 +228,43 @@ class RigidTransform:
         # Case 1: trace > 0 (standard case)
         mask1 = trace > 0
         if mask1.any():
-            s = 0.5 / torch.sqrt(trace[mask1] + 1.0)
-            q_w[mask1] = 0.25 / s  
-            q_x[mask1] = (matrices[mask1, 2, 1] - matrices[mask1, 1, 2]) * s
-            q_y[mask1] = (matrices[mask1, 0, 2] - matrices[mask1, 2, 0]) * s
-            q_z[mask1] = (matrices[mask1, 1, 0] - matrices[mask1, 0, 1]) * s
+            trace_safe = torch.clamp(trace[mask1] + 1.0, min=1e-8)
+            s = 0.5 / torch.sqrt(trace_safe)
+            s_safe = torch.clamp(s, min=1e-8)
+            q_w[mask1] = 0.25 / s_safe  
+            q_x[mask1] = (matrices[mask1, 2, 1] - matrices[mask1, 1, 2]) * s_safe
+            q_y[mask1] = (matrices[mask1, 0, 2] - matrices[mask1, 2, 0]) * s_safe
+            q_z[mask1] = (matrices[mask1, 1, 0] - matrices[mask1, 0, 1]) * s_safe
         
         # Case 2: diagonal element 0 is largest
         mask2 = (trace <= 0) & (matrices[..., 0, 0] > matrices[..., 1, 1]) & (matrices[..., 0, 0] > matrices[..., 2, 2])
         if mask2.any():
-            s = 2.0 * torch.sqrt(1.0 + matrices[mask2, 0, 0] - matrices[mask2, 1, 1] - matrices[mask2, 2, 2])
-            q_w[mask2] = (matrices[mask2, 2, 1] - matrices[mask2, 1, 2]) / s
-            q_x[mask2] = 0.25 * s
-            q_y[mask2] = (matrices[mask2, 0, 1] + matrices[mask2, 1, 0]) / s
-            q_z[mask2] = (matrices[mask2, 0, 2] + matrices[mask2, 2, 0]) / s
+            s = 2.0 * torch.sqrt(torch.clamp(1.0 + matrices[mask2, 0, 0] - matrices[mask2, 1, 1] - matrices[mask2, 2, 2], min=1e-8))
+            s_safe = torch.clamp(s, min=1e-8)
+            q_w[mask2] = (matrices[mask2, 2, 1] - matrices[mask2, 1, 2]) / s_safe
+            q_x[mask2] = 0.25 * s_safe
+            q_y[mask2] = (matrices[mask2, 0, 1] + matrices[mask2, 1, 0]) / s_safe
+            q_z[mask2] = (matrices[mask2, 0, 2] + matrices[mask2, 2, 0]) / s_safe
         
         # Case 3: diagonal element 1 is largest
         mask3 = (trace <= 0) & (matrices[..., 1, 1] > matrices[..., 2, 2]) & ~mask2
         if mask3.any():
-            s = 2.0 * torch.sqrt(1.0 + matrices[mask3, 1, 1] - matrices[mask3, 0, 0] - matrices[mask3, 2, 2])
-            q_w[mask3] = (matrices[mask3, 0, 2] - matrices[mask3, 2, 0]) / s
-            q_x[mask3] = (matrices[mask3, 0, 1] + matrices[mask3, 1, 0]) / s
-            q_y[mask3] = 0.25 * s
-            q_z[mask3] = (matrices[mask3, 1, 2] + matrices[mask3, 2, 1]) / s
+            s = 2.0 * torch.sqrt(torch.clamp(1.0 + matrices[mask3, 1, 1] - matrices[mask3, 0, 0] - matrices[mask3, 2, 2], min=1e-8))
+            s_safe = torch.clamp(s, min=1e-8)
+            q_w[mask3] = (matrices[mask3, 0, 2] - matrices[mask3, 2, 0]) / s_safe
+            q_x[mask3] = (matrices[mask3, 0, 1] + matrices[mask3, 1, 0]) / s_safe
+            q_y[mask3] = 0.25 * s_safe
+            q_z[mask3] = (matrices[mask3, 1, 2] + matrices[mask3, 2, 1]) / s_safe
         
         # Case 4: diagonal element 2 is largest
         mask4 = (trace <= 0) & ~mask2 & ~mask3
         if mask4.any():
-            s = 2.0 * torch.sqrt(1.0 + matrices[mask4, 2, 2] - matrices[mask4, 0, 0] - matrices[mask4, 1, 1])
-            q_w[mask4] = (matrices[mask4, 1, 0] - matrices[mask4, 0, 1]) / s
-            q_x[mask4] = (matrices[mask4, 0, 2] + matrices[mask4, 2, 0]) / s
-            q_y[mask4] = (matrices[mask4, 1, 2] + matrices[mask4, 2, 1]) / s
-            q_z[mask4] = 0.25 * s
+            s = 2.0 * torch.sqrt(torch.clamp(1.0 + matrices[mask4, 2, 2] - matrices[mask4, 0, 0] - matrices[mask4, 1, 1], min=1e-8))
+            s_safe = torch.clamp(s, min=1e-8)
+            q_w[mask4] = (matrices[mask4, 1, 0] - matrices[mask4, 0, 1]) / s_safe
+            q_x[mask4] = (matrices[mask4, 0, 2] + matrices[mask4, 2, 0]) / s_safe
+            q_y[mask4] = (matrices[mask4, 1, 2] + matrices[mask4, 2, 1]) / s_safe
+            q_z[mask4] = 0.25 * s_safe
         
         # Normalize quaternions
         quaternions = torch.stack([q_w, q_x, q_y, q_z], dim=-1)
@@ -127,6 +279,18 @@ class RigidTransform:
                        rotations: torch.Tensor, 
                        translations: torch.Tensor) -> torch.Tensor:
         """Apply rigid transformation to coordinates with validation."""
+        # Input validation
+        if not isinstance(coords, torch.Tensor) or not isinstance(rotations, torch.Tensor) or not isinstance(translations, torch.Tensor):
+            raise ValueError("All inputs must be torch tensors")
+        
+        # Check for NaN or Inf values
+        if torch.isnan(coords).any() or torch.isinf(coords).any():
+            raise ValueError("coords contains NaN or Inf values")
+        if torch.isnan(rotations).any() or torch.isinf(rotations).any():
+            raise ValueError("rotations contains NaN or Inf values")
+        if torch.isnan(translations).any() or torch.isinf(translations).any():
+            raise ValueError("translations contains NaN or Inf values")
+        
         # Validate input shapes
         if coords.dim() < 2 or coords.shape[-1] != 3:
             raise ValueError(f"Expected coords with shape (..., N, 3), got {coords.shape}")
@@ -167,13 +331,13 @@ class InvariantPointAttention(nn.Module):
         self.v_proj = nn.Linear(self.d_model, self.d_model)
         
         # Point attention projections
-        self.point_q_proj = nn.Linear(3, self.n_heads * 16)
-        self.point_k_proj = nn.Linear(3, self.n_heads * 16)
-        self.point_v_proj = nn.Linear(3, self.n_heads * 16)
+        self.point_q_proj = nn.Linear(3, self.n_heads * MODEL.POINT_ATTENTION_DIM)
+        self.point_k_proj = nn.Linear(3, self.n_heads * MODEL.POINT_ATTENTION_DIM)
+        self.point_v_proj = nn.Linear(3, self.n_heads * MODEL.POINT_ATTENTION_DIM)
         
         # Output projections
         self.out_proj = nn.Linear(self.d_model, self.d_model)
-        self.point_out_proj = nn.Linear(self.n_heads * 16, 3)
+        self.point_out_proj = nn.Linear(self.n_heads * MODEL.POINT_ATTENTION_DIM, 3)
         
         # Attention bias
         self.attention_bias = nn.Parameter(torch.zeros(self.n_heads))
@@ -203,16 +367,16 @@ class InvariantPointAttention(nn.Module):
         
         # Point attention (use representative atom, e.g., C4')
         rep_coords = coords[..., 1, :]  # Use second atom as representative
-        point_q = self.point_q_proj(rep_coords).view(batch_size, seq_len, self.n_heads, 16)
-        point_k = self.point_k_proj(rep_coords).view(batch_size, seq_len, self.n_heads, 16)
-        point_v = self.point_v_proj(rep_coords).view(batch_size, seq_len, self.n_heads, 16)
+        point_q = self.point_q_proj(rep_coords).view(batch_size, seq_len, self.n_heads, MODEL.POINT_ATTENTION_DIM)
+        point_k = self.point_k_proj(rep_coords).view(batch_size, seq_len, self.n_heads, MODEL.POINT_ATTENTION_DIM)
+        point_v = self.point_v_proj(rep_coords).view(batch_size, seq_len, self.n_heads, MODEL.POINT_ATTENTION_DIM)
         
         # Compute attention scores
         seq_scores = torch.einsum('bihd,bjhd->bhij', q, k) * self.scale
         
         # Point attention scores
         point_scores = torch.einsum('bihd,bjhd->bhij', point_q, point_k)
-        point_scores = point_scores / math.sqrt(16)
+        point_scores = point_scores / math.sqrt(MODEL.POINT_ATTENTION_DIM)
         
         # Combine scores
         combined_scores = seq_scores + point_scores + self.attention_bias.unsqueeze(-1).unsqueeze(-1)
@@ -231,7 +395,7 @@ class InvariantPointAttention(nn.Module):
         
         # Apply attention to point coordinates
         point_context = torch.einsum('bhij,bjhd->bihd', attn_weights, point_v)
-        point_context = point_context.contiguous().view(batch_size, seq_len, self.n_heads * 16)
+        point_context = point_context.contiguous().view(batch_size, seq_len, self.n_heads * MODEL.POINT_ATTENTION_DIM)
         
         # Output projections
         seq_out = self.out_proj(seq_context)
@@ -434,7 +598,7 @@ class GeometryModule(nn.Module):
         # Place atoms in a simple linear arrangement
         for i in range(seq_len):
             for j in range(self.config.n_atoms_per_residue):
-                coords[:, i, j, 0] = i * 3.4  # 3.4 Å spacing along x-axis
+                coords[:, i, j, 0] = i * BIOLOGICAL.C5_C4_BOND_LENGTH  # Bond length spacing along x-axis
                 coords[:, i, j, 1] = j * 1.0  # Small offset in y for different atoms
         
         return coords
@@ -445,35 +609,42 @@ def fape_loss(pred_coords: torch.Tensor,
               true_coords: torch.Tensor,
               true_frames: torch.Tensor,
               mask: torch.Tensor,
-              clamp_distance: float = 10.0) -> torch.Tensor:
-    """Frame-Aligned Point Error (FAPE) loss."""
+              clamp_distance: float = GEOMETRY.FAPE_CLAMP_DISTANCE) -> torch.Tensor:
+    """Frame-Aligned Point Error (FAPE) loss with improved numerical stability."""
     batch_size, seq_len, n_atoms, _ = pred_coords.shape
+    device = pred_coords.device
+    dtype = pred_coords.dtype
     
-    # Transform coordinates to local frames with numerical stability
-    try:
-        pred_rot_matrices = RigidTransform.quaternion_to_matrix(pred_frames)
-        true_rot_matrices = RigidTransform.quaternion_to_matrix(true_frames)
-        
-        # Safe matrix inverse with regularization
-        pred_rot_inv = torch.inverse(pred_rot_matrices + torch.eye(3, device=pred_rot_matrices.device, dtype=pred_rot_matrices.dtype) * 1e-6)
-        true_rot_inv = torch.inverse(true_rot_matrices + torch.eye(3, device=true_rot_matrices.device, dtype=true_rot_matrices.dtype) * 1e-6)
-        
-        pred_local = RigidTransform.apply_transform(
-            pred_coords - pred_frames[..., :3, 3].unsqueeze(2),
-            pred_rot_inv,
-            torch.zeros_like(pred_frames[..., :3, 3]).unsqueeze(2)
-        )
-        
-        true_local = RigidTransform.apply_transform(
-            true_coords - true_frames[..., :3, 3].unsqueeze(2),
-            true_rot_inv,
-            torch.zeros_like(true_frames[..., :3, 3]).unsqueeze(2)
-        )
-    except torch.linalg.LinAlgError as e:
-        # Fallback to identity transformation if matrix inversion fails
-        pred_local = pred_coords
-        true_local = true_coords
-        logging.warning(f"Matrix inversion failed in FAPE loss, using identity: {e}")
+    # Input validation
+    if torch.isnan(pred_coords).any() or torch.isinf(pred_coords).any():
+        raise ValueError("pred_coords contains NaN or Inf values")
+    if torch.isnan(true_coords).any() or torch.isinf(true_coords).any():
+        raise ValueError("true_coords contains NaN or Inf values")
+    if torch.isnan(pred_frames).any() or torch.isinf(pred_frames).any():
+        raise ValueError("pred_frames contains NaN or Inf values")
+    if torch.isnan(true_frames).any() or torch.isinf(true_frames).any():
+        raise ValueError("true_frames contains NaN or Inf values")
+    
+    # Convert quaternions to rotation matrices
+    pred_rot_matrices = RigidTransform.quaternion_to_matrix(pred_frames)
+    true_rot_matrices = RigidTransform.quaternion_to_matrix(true_frames)
+    
+    # Use transpose instead of inverse for rotation matrices (more numerically stable)
+    # For proper rotation matrices, transpose equals inverse
+    pred_rot_inv = pred_rot_matrices.transpose(-2, -1)
+    true_rot_inv = true_rot_matrices.transpose(-2, -1)
+    
+    # Extract translation components (use coordinate centers)
+    pred_trans = pred_coords.mean(dim=-2, keepdim=True)  # (batch_size, seq_len, 1, 3)
+    true_trans = true_coords.mean(dim=-2, keepdim=True)  # (batch_size, seq_len, 1, 3)
+    
+    # Center coordinates
+    pred_centered = pred_coords - pred_trans
+    true_centered = true_coords - true_trans
+    
+    # Transform to local frames using matrix multiplication (more efficient than apply_transform)
+    pred_local = torch.einsum('...ij,...nj->...ni', pred_rot_inv, pred_centered)
+    true_local = torch.einsum('...ij,...nj->...ni', true_rot_inv, true_centered)
     
     # Compute squared errors
     squared_errors = ((pred_local - true_local) ** 2).sum(dim=-1)
@@ -482,8 +653,12 @@ def fape_loss(pred_coords: torch.Tensor,
     squared_errors = torch.clamp(squared_errors, max=clamp_distance**2)
     squared_errors = squared_errors * mask.unsqueeze(-1)
     
-    # Return mean error
-    return squared_errors.sum() / (mask.sum() * n_atoms + 1e-8)
+    # Return mean error with proper normalization
+    total_elements = mask.sum() * n_atoms
+    if total_elements == 0:
+        return torch.tensor(0.0, device=device, dtype=dtype)
+    
+    return squared_errors.sum() / total_elements
 
 
 def geometry_loss(distance_logits: torch.Tensor,
@@ -522,7 +697,7 @@ def geometry_loss(distance_logits: torch.Tensor,
             target_flat[mask_flat],
             ignore_index=-100
         )
-        loss += 0.5 * angle_loss
+        loss += MODEL.SS_LOSS_WEIGHT * angle_loss
     
     # Torsion loss
     if target_torsions is not None:
@@ -535,7 +710,7 @@ def geometry_loss(distance_logits: torch.Tensor,
             target_flat[mask_flat],
             ignore_index=-100
         )
-        loss += 0.5 * torsion_loss
+        loss += MODEL.SS_LOSS_WEIGHT * torsion_loss
     
     # Sugar pucker loss
     if target_puckers is not None:
@@ -548,6 +723,6 @@ def geometry_loss(distance_logits: torch.Tensor,
             target_flat[mask_flat],
             ignore_index=-100
         )
-        loss += 0.3 * pucker_loss
+        loss += MODEL.PUCKER_LOSS_WEIGHT * pucker_loss
     
     return loss

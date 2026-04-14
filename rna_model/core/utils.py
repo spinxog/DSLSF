@@ -2,16 +2,29 @@
 
 import torch
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Union, Any
+from typing import Dict, List, Tuple, Optional, Union, Any, Sequence
 import math
 import hashlib
 import pickle
 from functools import lru_cache
 
+from .constants import BIOLOGICAL, GEOMETRY, COMPUTATIONAL, MODEL, VALIDATION
+from .error_handling import ValidationError, ComputationError
+
 
 def tokenize_rna_sequence(sequence: str) -> torch.Tensor:
     """Convert RNA sequence to token IDs."""
-    token_map = {'A': 0, 'U': 1, 'G': 2, 'C': 3, 'N': 4}
+    # Input validation
+    if not isinstance(sequence, str):
+        raise ValueError(f"sequence must be a string, got {type(sequence)}")
+    
+    if not sequence:
+        return torch.tensor([], dtype=torch.long)
+    
+    if len(sequence) > VALIDATION.MAX_SEQUENCE_LENGTH:
+        raise ValueError(f"sequence too long: {len(sequence)} > {VALIDATION.MAX_SEQUENCE_LENGTH}")
+    
+    token_map = {nuc: i for i, nuc in enumerate(BIOLOGICAL.VALID_NUCLEOTIDES_UPPER)}
     
     tokens = []
     for nucleotide in sequence.upper():
@@ -25,7 +38,7 @@ def tokenize_rna_sequence(sequence: str) -> torch.Tensor:
 
 def decode_tokens(tokens: torch.Tensor) -> str:
     """Convert token IDs back to RNA sequence."""
-    token_map = {0: 'A', 1: 'U', 2: 'G', 3: 'C', 4: 'N'}
+    token_map = {i: nuc for i, nuc in enumerate(BIOLOGICAL.VALID_NUCLEOTIDES_UPPER)}
     
     sequence = ""
     for token in tokens:
@@ -34,12 +47,19 @@ def decode_tokens(tokens: torch.Tensor) -> str:
     return sequence
 
 
-def compute_contact_map(coords: np.ndarray, threshold: float = 8.0) -> np.ndarray:
-    """Compute contact map from coordinates using vectorized operations.
+def compute_contact_map(
+    coords: np.ndarray, 
+    threshold: Optional[float] = None, 
+    chunk_size: Optional[int] = None, 
+    memory_efficient: bool = True
+) -> np.ndarray:
+    """Compute contact map from coordinates using memory-efficient operations.
     
     Args:
         coords: Coordinate array of shape (N, 3)
         threshold: Distance threshold for contact definition
+        chunk_size: Size of chunks for memory-efficient computation
+        memory_efficient: Whether to use memory-efficient computation for large systems
         
     Returns:
         Boolean contact map of shape (N, N)
@@ -47,23 +67,91 @@ def compute_contact_map(coords: np.ndarray, threshold: float = 8.0) -> np.ndarra
     Raises:
         ValueError: If coords is not 2D or has wrong shape
     """
+    # Set defaults from constants
+    if threshold is None:
+        threshold = GEOMETRY.CONTACT_DISTANCE_THRESHOLD
+    if chunk_size is None:
+        chunk_size = COMPUTATIONAL.CONTACT_MAP_CHUNK_SIZE
+    
+    # Input validation
+    if not isinstance(coords, np.ndarray):
+        raise ValueError("coords must be a numpy array")
+    
     if coords.ndim != 2 or coords.shape[1] != 3:
         raise ValueError(f"Expected 2D coordinates with 3 columns, got shape {coords.shape}")
     
+    if not isinstance(threshold, (int, float)) or threshold <= 0:
+        raise ValueError(f"threshold must be a positive number, got {threshold}")
+    
+    if len(coords) == 0:
+        return np.zeros((0, 0), dtype=bool)
+    
+    # Check for NaN or Inf values
+    if np.isnan(coords).any() or np.isinf(coords).any():
+        raise ValueError("coords contains NaN or Inf values")
+    
     n_atoms = len(coords)
     
-    # Vectorized distance computation
-    # Compute pairwise differences: (N, 1, 3) - (1, N, 3) -> (N, N, 3)
-    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+    # Use memory-efficient computation for large systems or when requested
+    if memory_efficient and n_atoms > COMPUTATIONAL.MEDIUM_SYSTEM_THRESHOLD:
+        return _memory_efficient_contact_map(coords, threshold, chunk_size)
     
-    # Compute distances: sqrt(sum(diff^2, axis=2)) -> (N, N)
-    distances = np.sqrt(np.sum(diff**2, axis=2))
+    # Optimized vectorized distance computation
+    # Use squared distances to avoid sqrt until the end
+    if n_atoms <= COMPUTATIONAL.SMALL_SYSTEM_THRESHOLD:
+        # Small systems: use standard vectorized approach
+        diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+        squared_distances = np.einsum('ijk,ijk->ij', diff, diff)
+        distances = np.sqrt(squared_distances, out=squared_distances)  # In-place sqrt
+    else:
+        # Medium systems: use chunked computation
+        distances = _compute_distance_matrix_chunked(coords, chunk_size)
     
     # Create contact map (exclude diagonal)
     contact_map = distances < threshold
     np.fill_diagonal(contact_map, False)
     
     return contact_map
+
+def _memory_efficient_contact_map(
+    coords: np.ndarray, 
+    threshold: float, 
+    chunk_size: int
+) -> np.ndarray:
+    """Memory-efficient contact map computation for large systems."""
+    n_atoms = len(coords)
+    contact_map = np.zeros((n_atoms, n_atoms), dtype=bool)
+    threshold_squared = threshold * threshold  # Compare squared distances
+    
+    # Process in chunks to reduce memory usage
+    for i in range(0, n_atoms, chunk_size):
+        end_i = min(i + chunk_size, n_atoms)
+        
+        for j in range(i, n_atoms, chunk_size):  # Start from i for symmetry
+            end_j = min(j + chunk_size, n_atoms)
+            
+            # Skip diagonal chunks
+            if i == j:
+                continue
+            
+            # Compute chunk distances efficiently
+            chunk_i = coords[i:end_i]
+            chunk_j = coords[j:end_j]
+            
+            # Use broadcasting for chunk computation
+            diff = chunk_i[:, np.newaxis, :] - chunk_j[np.newaxis, :, :]
+            squared_distances = np.einsum('ijk,ijk->ij', diff, diff)
+            
+            # Compare with squared threshold to avoid sqrt
+            chunk_contacts = squared_distances < threshold_squared
+            
+            # Store results
+            contact_map[i:end_i, j:end_j] = chunk_contacts
+            contact_map[j:end_j, i:end_i] = chunk_contacts.T  # Symmetric
+    
+    return contact_map
+
+
 
 
 def tensor_hash(tensor: torch.Tensor) -> str:
@@ -73,190 +161,157 @@ def tensor_hash(tensor: torch.Tensor) -> str:
     return hashlib.md5(tensor_bytes).hexdigest()
 
 
-@lru_cache(maxsize=1000)
+import gc
+import threading
+from functools import wraps
+
+# Memory-aware cache management
+class MemoryAwareCache:
+    """Memory-aware caching with automatic cleanup."""
+    
+    def __init__(self, max_cache_size_mb: int = 100, max_entries: int = 500) -> None:
+        self.max_cache_size_mb: int = max_cache_size_mb
+        self.max_entries: int = max_entries
+        self._cache: Dict[Tuple, np.ndarray] = {}
+        self._cache_sizes: Dict[Tuple, float] = {}
+        self._access_count: Dict[Tuple, int] = {}
+        self._lock = threading.RLock()
+        self._total_size_mb: float = 0.0
+        self._cleanup_threshold: float = 0.8  # Cleanup when 80% full
+    
+    def get(self, key: Tuple) -> Optional[np.ndarray]:
+        """Get value from cache with access tracking."""
+        with self._lock:
+            if key in self._cache:
+                self._access_count[key] = self._access_count.get(key, 0) + 1
+                return self._cache[key].copy()  # Return copy to prevent modification
+            return None
+    
+    def put(self, key: Tuple, value: np.ndarray) -> None:
+        """Put value in cache with memory management."""
+        with self._lock:
+            # Estimate memory usage
+            value_size_mb = value.nbytes / (1024 * 1024)
+            
+            # Check if we need to cleanup
+            if (self._total_size_mb + value_size_mb > self.max_cache_size_mb * self._cleanup_threshold or
+                len(self._cache) >= self.max_entries * self._cleanup_threshold):
+                self._cleanup_lru()
+            
+            # Add to cache
+            if key in self._cache:
+                # Update existing entry
+                self._total_size_mb -= self._cache_sizes.get(key, 0)
+            
+            self._cache[key] = value.copy()  # Store copy
+            self._cache_sizes[key] = value_size_mb
+            self._access_count[key] = 1
+            self._total_size_mb += value_size_mb
+    
+    def _cleanup_lru(self) -> None:
+        """Remove least recently used entries."""
+        if not self._cache:
+            return
+        
+        # Sort by access count (least used first)
+        sorted_keys = sorted(self._cache.keys(), key=lambda k: self._access_count.get(k, 0))
+        
+        # Remove entries until we're under threshold
+        target_size = self.max_cache_size_mb * 0.5  # Target 50% after cleanup
+        target_entries = self.max_entries * 0.5
+        
+        removed = 0
+        for key in sorted_keys:
+            if (self._total_size_mb <= target_size and 
+                len(self._cache) <= target_entries):
+                break
+            
+            self._total_size_mb -= self._cache_sizes.get(key, 0)
+            del self._cache[key]
+            del self._cache_sizes[key]
+            del self._access_count[key]
+            removed += 1
+        
+        # Force garbage collection if we removed many items
+        if removed > 10:
+            gc.collect()
+    
+    def clear(self) -> None:
+        """Clear all cache entries."""
+        with self._lock:
+            self._cache.clear()
+            self._cache_sizes.clear()
+            self._access_count.clear()
+            self._total_size_mb = 0.0
+            gc.collect()
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        with self._lock:
+            return {
+                'entries': len(self._cache),
+                'size_mb': self._total_size_mb,
+                'max_entries': self.max_entries,
+                'max_size_mb': self.max_cache_size_mb
+            }
+
+# Global cache instance
+_distance_cache = MemoryAwareCache(
+    max_cache_size_mb=COMPUTATIONAL.DEFAULT_CACHE_SIZE_MB, 
+    max_entries=COMPUTATIONAL.DEFAULT_CACHE_ENTRIES
+)
+
 def cached_distance_matrix(coords_tuple: Tuple) -> np.ndarray:
-    """Cached distance matrix computation."""
+    """Cached distance matrix computation with memory management."""
+    # Try to get from cache
+    cached_result = _distance_cache.get(coords_tuple)
+    if cached_result is not None:
+        return cached_result
+    
+    # Compute distance matrix
     coords = np.array(coords_tuple).reshape(-1, 3)
     n_atoms = len(coords)
-    distances = np.zeros((n_atoms, n_atoms))
     
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            dist = np.linalg.norm(coords[i] - coords[j])
-            distances[i, j] = distances[j, i] = dist
+    # Use memory-efficient computation for large systems
+    if n_atoms > COMPUTATIONAL.MEDIUM_SYSTEM_THRESHOLD:
+        distances = _compute_distance_matrix_chunked(coords)
+    else:
+        # Vectorized computation using broadcasting
+        diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+        distances = np.linalg.norm(diff, axis=2)
+    
+    # Cache the result
+    _distance_cache.put(coords_tuple, distances)
     
     return distances
 
-
-def compute_tm_score(coords1: np.ndarray, coords2: np.ndarray) -> float:
-    """Compute TM-score between two coordinate sets.
+def _compute_distance_matrix_chunked(
+    coords: np.ndarray, 
+    chunk_size: Optional[int] = None
+) -> np.ndarray:
+    """Compute distance matrix in chunks to save memory."""
+    if chunk_size is None:
+        chunk_size = COMPUTATIONAL.DISTANCE_MATRIX_CHUNK_SIZE
     
-    Args:
-        coords1: First coordinate set of shape (N, 3)
-        coords2: Second coordinate set of shape (N, 3)
-        
-    Returns:
-        TM-score value between 0 and 1
-        
-    Raises:
-        ValueError: If coordinate arrays have different shapes
-    """
-    if coords1.shape != coords2.shape:
-        raise ValueError(f"Coordinate shapes must match: {coords1.shape} vs {coords2.shape}")
-    
-    if len(coords1) == 0:
-        return 0.0
-    
-    # Center coordinates
-    coords1_centered = coords1 - np.mean(coords1, axis=0)
-    coords2_centered = coords2 - np.mean(coords2, axis=0)
-    
-    # Compute RMSD
-    diff = coords1_centered - coords2_centered
-    rmsd = np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
-    
-    # TM-score formula with proper handling of short sequences
-    n = len(coords1)
-    if n <= 15:
-        d0 = 0.5  # For short sequences (< 15 residues)
-    else:
-        d0 = 1.24 * (n - 15) ** (1/3) - 1.8
-        d0 = max(0.5, d0)  # Minimum d0 for all sequences
-    
-    tm_score = 1 / (1 + (rmsd / d0) ** 2)
-    
-    return tm_score
-
-
-def compute_rmsd(coords1: np.ndarray, coords2: np.ndarray) -> float:
-    """Compute RMSD between two coordinate sets."""
-    diff = coords1 - coords2
-    return np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))
-
-
-def superimpose_coordinates(coords1: np.ndarray, coords2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Superimpose two coordinate sets using Kabsch algorithm."""
-    # Center coordinates
-    center1 = np.mean(coords1, axis=0)
-    center2 = np.mean(coords2, axis=0)
-    
-    coords1_centered = coords1 - center1
-    coords2_centered = coords2 - center2
-    
-    # Compute covariance matrix (correct order for Kabsch algorithm)
-    cov_matrix = np.dot(coords1_centered.T, coords2_centered)
-    
-    # SVD
-    U, S, Vt = np.linalg.svd(cov_matrix)
-    
-    # Rotation matrix (correct order: R = V * U^T)
-    rotation = np.dot(Vt.T, U)
-    
-    # Ensure proper orientation (reflection correction)
-    if np.linalg.det(rotation) < 0:
-        Vt[-1, :] *= -1
-        rotation = np.dot(Vt.T, U)
-    
-    # Apply rotation to align coords2 to coords1
-    coords2_aligned = np.dot(coords2_centered, rotation) + center1
-    
-    return coords1, coords2_aligned
-
-
-def create_submission_format(predictions: List[Dict]) -> np.ndarray:
-    """Create submission format from predictions."""
-    all_coords = []
-    
-    for pred in predictions:
-        coords = pred["coordinates"]  # Should be (n_decoys * n_residues, 3)
-        all_coords.append(coords)
-    
-    return np.concatenate(all_coords, axis=0)
-
-
-def validate_sequence(sequence: str) -> bool:
-    """Validate RNA sequence."""
-    valid_nucleotides = set('AUGCaugcNn')
-    
-    for nucleotide in sequence:
-        if nucleotide not in valid_nucleotides:
-            return False
-    
-    return True
-
-
-def mask_sequence(sequence: str, mask_prob: float = 0.15) -> Tuple[str, List[int]]:
-    """Create masked sequence for pretraining."""
-    tokens = list(sequence)
-    mask_positions = []
-    
-    for i, token in enumerate(tokens):
-        if np.random.random() < mask_prob:
-            mask_positions.append(i)
-            tokens[i] = 'N'
-    
-    masked_sequence = ''.join(tokens)
-    return masked_sequence, mask_positions
-
-
-def compute_contact_map(coords: np.ndarray, threshold: float = 8.0) -> np.ndarray:
-    """Compute contact map from coordinates using vectorized operations."""
-    if len(coords) == 0:
-        return np.zeros((0, 0), dtype=int)
-    
-    # Compute pairwise distance matrix using broadcasting
-    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
-    distances = np.linalg.norm(diff, axis=2)
-    
-    # Create contact map (symmetric)
-    contact_map = (distances < threshold).astype(int)
-    
-    # Set diagonal to 0 (no self-contacts)
-    np.fill_diagonal(contact_map, 0)
-    
-    return contact_map
-
-
-def bin_distances(distances: np.ndarray, n_bins: int = 64, max_dist: float = 20.0) -> np.ndarray:
-    """Bin distances for distance prediction."""
-    bin_edges = np.linspace(0, max_dist, n_bins + 1)
-    binned = np.digitize(distances, bin_edges) - 1
-    binned = np.clip(binned, 0, n_bins - 1)
-    return binned
-
-
-def unbin_distances(binned_distances: np.ndarray, n_bins: int = 64, max_dist: float = 20.0) -> np.ndarray:
-    """Convert binned distances back to continuous values."""
-    bin_edges = np.linspace(0, max_dist, n_bins + 1)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    return bin_centers[binned_distances]
-
-
-def compute_angles(coords: np.ndarray) -> np.ndarray:
-    """Compute bond angles from coordinates with proper error handling."""
     n_atoms = len(coords)
-    angles = []
+    distances = np.zeros((n_atoms, n_atoms), dtype=coords.dtype)
     
-    for i in range(n_atoms - 2):
-        v1 = coords[i] - coords[i + 1]
-        v2 = coords[i + 2] - coords[i + 1]
-        
-        # Check for zero vectors (overlapping atoms)
-        v1_norm = np.linalg.norm(v1)
-        v2_norm = np.linalg.norm(v2)
-        
-        if v1_norm < 1e-8 or v2_norm < 1e-8:
-            # Overlapping atoms, angle is undefined, skip
-            continue
-        
-        cos_angle = np.dot(v1, v2) / (v1_norm * v2_norm)
-        cos_angle = np.clip(cos_angle, -1.0, 1.0)
-        angle = np.arccos(cos_angle)
-        
-        angles.append(angle)
+    for i in range(0, n_atoms, chunk_size):
+        end_i = min(i + chunk_size, n_atoms)
+        for j in range(i, n_atoms, chunk_size):  # Start from i for symmetry
+            end_j = min(j + chunk_size, n_atoms)
+            
+            # Compute chunk distances
+            chunk_i = coords[i:end_i]
+            chunk_j = coords[j:end_j]
+            
+            diff = chunk_i[:, np.newaxis, :] - chunk_j[np.newaxis, :, :]
+            squared_dist = np.einsum('ijk,ijk->ij', diff, diff)
+            distances[i:end_i, j:end_j] = np.sqrt(squared_dist, out=squared_dist)
+            if i != j:  # Fill symmetric part
+                distances[j:end_j, i:end_i] = distances[i:end_i, j:end_j].T
     
-    return np.array(angles) if angles else np.array([])
-
+    return distances
 
 def compute_dihedrals(coords: np.ndarray) -> np.ndarray:
     """Compute dihedral angles from coordinates."""
@@ -281,7 +336,9 @@ def compute_dihedrals(coords: np.ndarray) -> np.ndarray:
         n1_norm = np.linalg.norm(n1)
         b1_norm = np.linalg.norm(b1)
         
-        if n0_norm < 1e-8 or n1_norm < 1e-8 or b1_norm < 1e-8:
+        if (n0_norm < GEOMETRY.ZERO_VECTOR_THRESHOLD or 
+            n1_norm < GEOMETRY.ZERO_VECTOR_THRESHOLD or 
+            b1_norm < GEOMETRY.ZERO_VECTOR_THRESHOLD):
             # Colinear atoms, dihedral is undefined, skip
             continue
         
@@ -302,15 +359,50 @@ def compute_dihedrals(coords: np.ndarray) -> np.ndarray:
 
 
 def create_distance_matrix(coords: np.ndarray) -> np.ndarray:
-    """Create pairwise distance matrix using vectorized operations."""
+    """Create pairwise distance matrix using optimized vectorized operations."""
     if len(coords) == 0:
-        return np.zeros((0, 0))
+        return np.zeros((0, 0), dtype=coords.dtype)
     
-    # Vectorized computation using broadcasting
-    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
-    dist_matrix = np.linalg.norm(diff, axis=2)
+    n_atoms = len(coords)
     
-    return dist_matrix
+    # For very large systems, use chunked computation to save memory
+    if n_atoms > 5000:
+        return _chunked_distance_matrix(coords)
+    
+    # Use more efficient computation with scipy if available, fallback to numpy
+    try:
+        from scipy.spatial.distance import pdist, squareform
+        return squareform(pdist(coords, metric='euclidean'))
+    except ImportError:
+        # Fallback to optimized numpy computation
+        # Use squared distances to avoid sqrt until the end
+        diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+        squared_dist = np.einsum('ijk,ijk->ij', diff, diff)
+        return np.sqrt(squared_dist, out=squared_dist)  # In-place sqrt
+
+
+def _chunked_distance_matrix(
+    coords: np.ndarray, 
+    chunk_size: int = 1000
+) -> np.ndarray:
+    """Compute distance matrix in chunks to save memory for large systems."""
+    n_atoms = len(coords)
+    distances = np.zeros((n_atoms, n_atoms), dtype=coords.dtype)
+    
+    for i in range(0, n_atoms, chunk_size):
+        end_i = min(i + chunk_size, n_atoms)
+        for j in range(0, n_atoms, chunk_size):
+            end_j = min(j + chunk_size, n_atoms)
+            
+            # Compute chunk distances
+            chunk_i = coords[i:end_i]
+            chunk_j = coords[j:end_j]
+            
+            diff = chunk_i[:, np.newaxis, :] - chunk_j[np.newaxis, :, :]
+            squared_dist = np.einsum('ijk,ijk->ij', diff, diff)
+            distances[i:end_i, j:end_j] = np.sqrt(squared_dist, out=squared_dist)
+    
+    return distances
 
 
 def apply_symmetry_operations(coords: np.ndarray) -> List[np.ndarray]:
@@ -347,8 +439,11 @@ def apply_symmetry_operations(coords: np.ndarray) -> List[np.ndarray]:
     return sym_coords
 
 
-def check_clashes(coords: np.ndarray, threshold: float = 2.0) -> int:
+def check_clashes(coords: np.ndarray, threshold: Optional[float] = None) -> int:
     """Count number of steric clashes."""
+    if threshold is None:
+        threshold = GEOMETRY.CLASH_DISTANCE_THRESHOLD
+    
     n_atoms = len(coords)
     clashes = 0
     
@@ -361,7 +456,10 @@ def check_clashes(coords: np.ndarray, threshold: float = 2.0) -> int:
     return clashes
 
 
-def compute_bond_lengths(coords: np.ndarray, bonds: List[Tuple[int, int]]) -> np.ndarray:
+def compute_bond_lengths(
+    coords: np.ndarray, 
+    bonds: List[Tuple[int, int]]
+) -> np.ndarray:
     """Compute bond lengths for specified bonds."""
     bond_lengths = []
     
@@ -372,10 +470,12 @@ def compute_bond_lengths(coords: np.ndarray, bonds: List[Tuple[int, int]]) -> np
     return np.array(bond_lengths)
 
 
-def check_bond_geometry(coords: np.ndarray,
-                       bonds: List[Tuple[int, int]],
-                       target_lengths: List[float],
-                       tolerance: float = 0.1) -> float:
+def check_bond_geometry(
+    coords: np.ndarray,
+    bonds: List[Tuple[int, int]],
+    target_lengths: List[float],
+    tolerance: float = 0.1
+) -> float:
     """Check bond geometry violations."""
     bond_lengths = compute_bond_lengths(coords, bonds)
     violations = 0
@@ -417,13 +517,62 @@ def memory_usage() -> Dict[str, Union[float, bool]]:
         return {"cpu_only": True}
 
 
-def clear_cache():
+def clear_cache() -> None:
     """Clear GPU cache."""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
-def set_seed(seed: int = 42):
+def validate_tensor(tensor: torch.Tensor, name: str = "tensor") -> torch.Tensor:
+    """Validate tensor for NaN/Inf values and reasonable ranges."""
+    if not isinstance(tensor, torch.Tensor):
+        raise ValidationError(f"{name} must be a torch.Tensor, got {type(tensor)}")
+    
+    if torch.isnan(tensor).any():
+        nan_count = torch.isnan(tensor).sum().item()
+        raise ValidationError(f"{name} contains {nan_count} NaN values")
+    
+    if torch.isinf(tensor).any():
+        inf_count = torch.isinf(tensor).sum().item()
+        raise ValidationError(f"{name} contains {inf_count} infinite values")
+    
+    # Check for reasonable value ranges
+    if tensor.numel() > 0:
+        min_val = tensor.min().item()
+        max_val = tensor.max().item()
+        
+        if abs(min_val) > GEOMETRY.MAX_COORDINATE_VALUE or abs(max_val) > GEOMETRY.MAX_COORDINATE_VALUE:
+            raise ValidationError(f"{name} has unreasonable value range: [{min_val:.2f}, {max_val:.2f}]")
+    
+    return tensor
+
+
+def validate_tensor_shape(tensor: torch.Tensor, expected_shape: Tuple[int, ...], name: str = "tensor") -> torch.Tensor:
+    """Validate tensor shape matches expected dimensions."""
+    validate_tensor(tensor, name)
+    
+    if len(expected_shape) != tensor.dim():
+        raise ValidationError(f"{name} has {tensor.dim()} dimensions, expected {len(expected_shape)}")
+    
+    for i, (expected, actual) in enumerate(zip(expected_shape, tensor.shape)):
+        if expected != -1 and expected != actual:  # -1 means any size allowed
+            raise ValidationError(f"{name} dimension {i} is {actual}, expected {expected}")
+    
+    return tensor
+
+
+def safe_tensor_operation(operation, *args, **kwargs):
+    """Safely execute tensor operations with validation."""
+    try:
+        result = operation(*args, **kwargs)
+        if isinstance(result, torch.Tensor):
+            validate_tensor(result, "operation_result")
+        return result
+    except Exception as e:
+        raise ComputationError(f"Tensor operation failed: {e}", cause=e)
+
+
+def set_seed(seed: int = 42) -> None:
     """Set random seeds for reproducibility."""
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)

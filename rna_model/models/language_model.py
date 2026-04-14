@@ -31,6 +31,11 @@ class PositionalEncoding(nn.Module):
     
     def __init__(self, d_model: int, max_seq_len: int = 2048):
         super().__init__()
+        
+        # Validate d_model to prevent division by zero
+        if d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {d_model}")
+        
         pe = torch.zeros(max_seq_len, d_model)
         position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
         
@@ -161,10 +166,13 @@ class RNALanguageModel(nn.Module):
         super().__init__()
         self.config = config
         
-        # Cache management
+        # Cache management with thread safety and memory tracking
         self._embedding_cache = {}
+        self._cache_sizes = {}  # Track memory usage of cached tensors
         self._cache_version = "1.0"
         self._max_cache_size = 1000
+        self._max_cache_memory_mb = 100  # Maximum memory usage in MB
+        self._total_cache_memory = 0.0
         self._cache_hits = 0
         self._cache_misses = 0
         self._cache_lock = threading.Lock()
@@ -196,6 +204,58 @@ class RNALanguageModel(nn.Module):
                     nn.init.zeros_(module.bias)
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def _get_cache_key(self, input_ids: torch.Tensor) -> str:
+        """Generate cache key for input tensor."""
+        return hashlib.md5(input_ids.cpu().numpy().tobytes()).hexdigest()
+    
+    def _get_cached_embeddings(self, cache_key: str) -> Optional[torch.Tensor]:
+        """Thread-safe cache retrieval."""
+        with self._cache_lock:
+            if cache_key in self._embedding_cache:
+                self._cache_hits += 1
+                return self._embedding_cache[cache_key].clone()
+            else:
+                self._cache_misses += 1
+                return None
+    
+    def _cache_embeddings(self, cache_key: str, embeddings: torch.Tensor):
+        """Thread-safe cache storage with memory-aware cleanup."""
+        with self._cache_lock:
+            # Calculate memory usage of new embeddings
+            embedding_memory_mb = embeddings.numel() * embeddings.element_size() / (1024 * 1024)
+            
+            # Check if we need to cleanup
+            while (len(self._embedding_cache) >= self._max_cache_size or 
+                   self._total_cache_memory + embedding_memory_mb > self._max_cache_memory_mb):
+                if not self._embedding_cache:
+                    break  # Cache is empty, can't cleanup further
+                
+                # Remove oldest entry (simple FIFO)
+                oldest_key = next(iter(self._embedding_cache))
+                oldest_memory = self._cache_sizes[oldest_key]
+                del self._embedding_cache[oldest_key]
+                del self._cache_sizes[oldest_key]
+                self._total_cache_memory -= oldest_memory
+            
+            # Add new entry
+            self._embedding_cache[cache_key] = embeddings.clone()
+            self._cache_sizes[cache_key] = embedding_memory_mb
+            self._total_cache_memory += embedding_memory_mb
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
+        with self._cache_lock:
+            total_requests = self._cache_hits + self._cache_misses
+            hit_rate = self._cache_hits / total_requests if total_requests > 0 else 0
+            return {
+                "cache_size": len(self._embedding_cache),
+                "hits": self._cache_hits,
+                "misses": self._cache_misses,
+                "hit_rate": hit_rate,
+                "memory_usage_mb": self._total_cache_memory,
+                "max_memory_mb": self._max_cache_memory_mb
+            }
     
     def create_span_mask(self, 
                         seq_len: int, 

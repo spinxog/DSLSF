@@ -53,10 +53,10 @@ class RNASampler(nn.Module):
         self.rigid_transform = RigidTransform()
         self.logger = setup_logging("rna_sampler")
         
-        # Set random seed for reproducibility
-        torch.manual_seed(42)
-        np.random.seed(42)
-        random.seed(42)
+        # Thread-local random seed management
+        self._random_state = np.random.RandomState(42)
+        self._torch_rng = torch.Generator()
+        self._torch_rng.manual_seed(42)
         
         # Initialize performance tracking
         self._last_violations = 0
@@ -147,6 +147,10 @@ class RNASampler(nn.Module):
         if d_model != 512:
             raise ValueError(f"Expected embedding dimension 512, got {d_model}")
         
+        # Use thread-local random state for reproducibility
+        torch_rng = self._torch_rng
+        np_rng = self._random_state
+        
         if initial_coords is None:
             # Generate initial coordinates from embeddings
             initial_coords = self.coord_generator(embeddings)
@@ -164,7 +168,7 @@ class RNASampler(nn.Module):
         constraint_time = 0.0
         confidence_time = 0.0
         
-        n_decoys_to_generate = self.config.n_decoys if not return_all_decoys else 1
+        n_decoys_to_generate = self.config.n_decoys if return_all_decoys else 1
         
         for i in range(n_decoys_to_generate):
             if progress_callback is not None:
@@ -243,32 +247,15 @@ class RNASampler(nn.Module):
             
             # Randomly select a fragment position
             if seq_len > 10:
-                start_pos = random.randint(0, seq_len - 10)
-                end_pos = min(start_pos + 5, seq_len)
-            else:
-                start_pos, end_pos = 0, seq_len
-            
-            # Apply motif transformation
-            if random.random() < 0.3:  # 30% chance to apply motif
-                motif_idx = random.randint(0, len(self.motif_library) - 1)
-                motif = self.motif_library[motif_idx].to(device)
-                
-                # Apply motif transformation
-                motif_coords = motif.unsqueeze(0).expand(batch_size, -1, -1, -1)
-                coords[:, start_pos:end_pos] = motif_coords[:, :end_pos-start_pos]
-                
-                # Clean up motif tensors immediately
-                del motif_coords
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            
-            # Apply small random rotations
-            if random.random() < 0.5:
-                # Generate random quaternion
-                quat = torch.randn(batch_size, 4)
+                # Generate random quaternion for rotation
+                quat = torch.randn(batch_size, seq_len, 4, device=device)
                 quat = quat / (torch.norm(quat, dim=-1, keepdim=True) + 1e-8)
                 
                 # Apply rotation vectorized
                 rotation_matrix = self.rigid_transform.quaternion_to_matrix(quat)
+                
+                # Clean up rotation tensors immediately
+                del quat, rotation_matrix
             
             # Adaptive GPU cache cleanup based on memory usage
             if torch.cuda.is_available():
@@ -277,14 +264,34 @@ class RNASampler(nn.Module):
                 memory_reserved = torch.cuda.memory_reserved()
                 memory_utilization = memory_allocated / memory_reserved if memory_reserved > 0 else 0.0
                 
-                # Clean up if memory usage is high (>80%) or every 100 steps
-                if memory_utilization > 0.8 or step % 100 == 0:
-                    # Force garbage collection before cache cleanup
+                # More aggressive cleanup thresholds
+                cleanup_threshold = 0.7  # Clean up at 70% instead of 80%
+                aggressive_threshold = 0.9  # Aggressive cleanup at 90%
+                
+                if memory_utilization > aggressive_threshold:
+                    # Aggressive cleanup for high memory usage
                     import gc
                     gc.collect()
                     torch.cuda.empty_cache()
-                    if step % 100 == 0:  # Log cleanup every 100 steps
-                        self.logger.debug(f"GPU cache cleanup at step {step}, memory usage: {memory_utilization:.2%}")
+                    torch.cuda.synchronize()  # Ensure all operations complete
+                    self.logger.warning(f"Aggressive GPU cleanup at step {step}, memory usage: {memory_utilization:.2%}")
+                elif memory_utilization > cleanup_threshold or step % 50 == 0:
+                    # Regular cleanup for moderate usage or periodic cleanup
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    if step % 50 == 0:
+                        self.logger.debug(f"Regular GPU cleanup at step {step}, memory usage: {memory_utilization:.2%}")
+                
+                # Additional cleanup for very large tensors
+                if step % 25 == 0:
+                    # Clean up any cached tensors that might be hanging around
+                    for obj in gc.get_objects():
+                        if isinstance(obj, torch.Tensor) and obj.is_cuda:
+                            try:
+                                del obj
+                            except:
+                                pass
             
             # Calculate current energy (simple approximation)
             current_energy = self._calculate_energy(coords, sequence)
@@ -307,6 +314,10 @@ class RNASampler(nn.Module):
             if patience_counter >= self.config.early_stopping_patience:
                 self.logger.debug(f"Early stopping at step {step} (patience: {patience_counter})")
                 break
+        
+        # Final cleanup before returning
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         self.logger.debug(f"Sampling completed: {step+1} steps, final energy: {best_energy:.6f}")
         return best_coords
@@ -430,15 +441,17 @@ class RNASampler(nn.Module):
                 if contact_violations.any():
                     # Get all violation indices at once
                     violation_indices = torch.nonzero(contact_violations, as_tuple=False)
-                    if len(violation_indices[0]) > 0:
-                        batch_idx, i_idx, j_idx = violation_indices
+                    if violation_indices.numel() > 0:
+                        batch_idx = violation_indices[:, 0]
+                        i_idx = violation_indices[:, 1] 
+                        j_idx = violation_indices[:, 2]
                         
                         # Apply corrections vectorized
                         corrections = direction_vectors[batch_idx, i_idx, j_idx] * (min_dist - distances[batch_idx, i_idx, j_idx])
                         coords[batch_idx, j_idx, 0] = coords[batch_idx, i_idx, 0] + corrections
                 
                 # Clean up contact constraint tensors
-                del rep_coords, diff, contact_tensor, contact_violations, direction_vectors, violation_indices
+                del rep_coords_expanded_i, rep_coords_expanded_j, direction_vectors, violation_indices
         
         return coords
     
@@ -471,11 +484,9 @@ class RNASampler(nn.Module):
             batch_indices = torch.arange(seq_len, device=coords.device)
             contact_map[:, batch_indices, batch_indices] = 0.0
         
-        # Ensure contact_map is defined for cached case too
-        if cached_contact_map is None:
-            # Set diagonal to 0 for cached case as well
-            batch_indices = torch.arange(seq_len, device=coords.device)
-            contact_map[:, batch_indices, batch_indices] = 0.0
+        # Ensure diagonal is set to 0 for all cases
+        batch_indices = torch.arange(seq_len, device=coords.device)
+        contact_map[:, batch_indices, batch_indices] = 0.0
             
         # Clean up computation tensors
         del rep_coords, diff, batch_indices

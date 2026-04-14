@@ -189,8 +189,84 @@ class DomainDocking:
     
     def _extract_junction_torsion(self, coords: np.ndarray) -> np.ndarray:
         """Extract junction torsion angles."""
-        # Simplified torsion extraction
-        return np.array([0.0, 0.0, 0.0])  # Placeholder
+        try:
+            n_residues = len(coords)
+            if n_residues < 4:
+                return np.array([0.0, 0.0, 0.0])
+            
+            # Find junction region (middle of structure)
+            junction_start = n_residues // 3
+            junction_end = 2 * n_residues // 3
+            junction_len = junction_end - junction_start
+            
+            if junction_len < 3:
+                return np.array([0.0, 0.0, 0.0])
+            
+            # Extract torsion angles from junction region
+            torsion_angles = []
+            
+            # Calculate dihedral angles for junction backbone
+            for i in range(junction_start, min(junction_end - 3, n_residues - 3)):
+                # Get four consecutive atoms (simplified - using C1' positions)
+                if i + 3 < n_residues:
+                    p1, p2, p3, p4 = coords[i], coords[i+1], coords[i+2], coords[i+3]
+                    
+                    # Calculate dihedral angle
+                    dihedral = self._calculate_dihedral(p1, p2, p3, p4)
+                    if dihedral is not None:
+                        torsion_angles.append(dihedral)
+            
+            if len(torsion_angles) == 0:
+                return np.array([0.0, 0.0, 0.0])
+            
+            # Return statistics of torsion angles
+            torsion_array = np.array(torsion_angles)
+            
+            return np.array([
+                np.mean(torsion_array),     # Mean torsion
+                np.std(torsion_array),      # Standard deviation
+                np.max(torsion_array) - np.min(torsion_array)  # Range
+            ])
+            
+        except Exception as e:
+            logging.warning(f"Error extracting junction torsion: {e}")
+            return np.array([0.0, 0.0, 0.0])
+    
+    def _calculate_dihedral(self, p1: np.ndarray, p2: np.ndarray, 
+                          p3: np.ndarray, p4: np.ndarray) -> Optional[float]:
+        """Calculate dihedral angle between four points."""
+        try:
+            # Vectors
+            v1 = p2 - p1
+            v2 = p3 - p2
+            v3 = p4 - p3
+            
+            # Normal vectors
+            n1 = np.cross(v1, v2)
+            n2 = np.cross(v2, v3)
+            
+            # Normalize
+            n1_norm = np.linalg.norm(n1)
+            n2_norm = np.linalg.norm(n2)
+            v2_norm = np.linalg.norm(v2)
+            
+            if n1_norm < 1e-8 or n2_norm < 1e-8 or v2_norm < 1e-8:
+                return None
+            
+            n1 = n1 / n1_norm
+            n2 = n2 / n2_norm
+            v2 = v2 / v2_norm
+            
+            # Calculate dihedral
+            m1 = np.cross(n1, v2)
+            x = np.dot(n1, n2)
+            y = np.dot(m1, n2)
+            
+            dihedral = np.arctan2(y, x)
+            return np.degrees(dihedral)
+            
+        except Exception:
+            return None
     
     def _compute_inter_domain_contacts(self, coords: np.ndarray,
                                 domain1_size: int, domain2_size: int) -> float:

@@ -336,7 +336,10 @@ class ActiveAugmentation:
                     augmented['base_example_id'] = examples.index(base_example)
                     
                     # Validate via rescoring consensus
-                    augmented['validation_score'] = np.random.random() * 0.5 + 0.5  # Placeholder
+                    validation_score = self._compute_validation_score(
+                        augmented['coordinates'], base_example['coordinates']
+                    )
+                    augmented['validation_score'] = validation_score
                     
                     augmented_data.append(augmented)
         
@@ -345,6 +348,38 @@ class ActiveAugmentation:
             json.dump(augmented_data, f, indent=2)
         
         print(f"✅ Active augmentation completed. Generated {len(augmented_data)} synthetic examples")
+    
+    def _compute_validation_score(self, coords1: np.ndarray, coords2: np.ndarray) -> float:
+        """Compute validation score comparing two coordinate sets."""
+        try:
+            from rna_model.core.utils import compute_rmsd, compute_tm_score
+            
+            # Ensure coordinates have same shape
+            if coords1.shape != coords2.shape:
+                # Reshape if necessary
+                min_len = min(len(coords1), len(coords2))
+                coords1 = coords1[:min_len]
+                coords2 = coords2[:min_len]
+            
+            if len(coords1) == 0:
+                return 0.5  # Default score for empty structures
+            
+            # Compute RMSD and TM-score
+            rmsd = compute_rmsd(coords1, coords2)
+            tm_score = compute_tm_score(coords1, coords2)
+            
+            # Combine metrics for validation score
+            # Lower RMSD and higher TM-score are better
+            rmsd_score = max(0, 1.0 - rmsd / 10.0)  # Normalize RMSD to [0, 1]
+            
+            # Weighted combination
+            validation_score = 0.6 * tm_score + 0.4 * rmsd_score
+            
+            return float(np.clip(validation_score, 0.0, 1.0))
+            
+        except Exception as e:
+            print(f"Warning: Failed to compute validation score: {e}")
+            return 0.5  # Default score on error
     
     def build_rescoring_floors(self, validation_data: List[Dict], output_path: str) -> None:
         """

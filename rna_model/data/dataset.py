@@ -109,8 +109,11 @@ class DatasetManager:
             json.dump(dataset_data, f)
         
         # Calculate checksum
-        with open(dataset_path, 'rb') as f:
-            checksum = hashlib.md5(f.read()).hexdigest()
+        try:
+            with open(dataset_path, 'rb') as f:
+                checksum = hashlib.md5(f.read()).hexdigest()
+        except IOError as e:
+            raise ValueError(f"Failed to calculate checksum for {dataset_path}: {e}")
         
         # Create dataset info
         dataset_info = DatasetInfo(

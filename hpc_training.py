@@ -352,18 +352,18 @@ class HPCTrainer:
             if self.is_distributed:
                 dist.barrier()
 
-def cleanup_checkpoints(self):
-    """Keep only recent checkpoints to save space."""
-    checkpoints = list(self.checkpoint_dir.glob("checkpoint_step_*.pth"))
-    checkpoints.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    def cleanup_checkpoints(self):
+        """Keep only recent checkpoints to save space."""
+        checkpoints = list(self.checkpoint_dir.glob("checkpoint_step_*.pth"))
+        checkpoints.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
-    # Keep last 5 + best model
-    for checkpoint in checkpoints[5:]:
-        try:
-            checkpoint.unlink()
-            self.logger.debug(f"Removed old checkpoint: {checkpoint}")
-        except Exception as e:
-            self.logger.warning(f"Failed to remove {checkpoint}: {e}")
+        # Keep last 5 + best model
+        for checkpoint in checkpoints[5:]:
+            try:
+                checkpoint.unlink()
+                self.logger.debug(f"Removed old checkpoint: {checkpoint}")
+            except Exception as e:
+                self.logger.warning(f"Failed to remove {checkpoint}: {e}")
     
     def train_epoch(self) -> Dict[str, float]:
         """Train for one epoch."""
@@ -471,13 +471,14 @@ def cleanup_checkpoints(self):
                     clear_cache()
                     self.logger.info("Performed periodic GPU cache cleanup")
                     
-                    # Additional cleanup if memory is high
-                    if 'allocated' in memory and memory['allocated'] > 40:  # 40GB
+                    # Additional cleanup if memory is high (configurable threshold)
+                    memory_threshold = getattr(self.config, 'memory_threshold_gb', 40)
+                    if 'allocated' in memory and memory['allocated'] > memory_threshold:
                         # Force garbage collection
                         import gc
                         gc.collect()
                         clear_cache()
-                        self.logger.warning("High memory usage detected, performed aggressive cleanup")
+                        self.logger.warning(f"High memory usage detected ({memory['allocated']:.1f}GB > {memory_threshold}GB), performed aggressive cleanup")
         
         except KeyboardInterrupt:
             self.logger.info("Training interrupted by user")
@@ -485,17 +486,22 @@ def cleanup_checkpoints(self):
             self.logger.error(f"Training failed: {e}")
             raise
         finally:
-            # Save final checkpoint
-            if self.rank == 0:
-                self.save_checkpoint()
-                
-                # Close tensorboard
-                if self.tensorboard_writer:
-                    self.tensorboard_writer.close()
-                
-                total_time = time.time() - start_time
-                self.logger.info(f"Training completed in {total_time/3600:.2f} hours")
-                self.logger.info(f"Final step: {self.global_step}, Final epoch: {self.epoch}")
+            # Ensure cleanup happens even if training fails
+            try:
+                # Save final checkpoint
+                if self.rank == 0:
+                    self.save_checkpoint()
+                    
+                    # Close tensorboard
+                    if self.tensorboard_writer:
+                        self.tensorboard_writer.close()
+                    
+                    total_time = time.time() - start_time
+                    self.logger.info(f"Training completed in {total_time/3600:.2f} hours")
+                    self.logger.info(f"Final step: {self.global_step}, Final epoch: {self.epoch}")
+            finally:
+                # Always cleanup distributed resources
+                self.cleanup()
     
     def cleanup(self):
         """Cleanup distributed training."""

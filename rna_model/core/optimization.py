@@ -147,6 +147,69 @@ class GridSearchOptimizer(HyperparameterOptimizer):
         # Limit number of evaluations
         return grid[:self.max_evaluations]
     
+    def evaluate_hyperparameters(self, params: Dict[str, Any], 
+                              train_data: List, val_data: List) -> float:
+        """Evaluate hyperparameters with actual training."""
+        try:
+            # Create training configuration from hyperparameters
+            config = self._create_training_config(params)
+            
+            # Create experiment configuration
+            exp_config = ExperimentConfig(
+                name=f"grid_search_{params.get('d_model', 256)}_{params.get('learning_rate', 1e-4)}",
+                description=f"Grid search evaluation",
+                max_epochs=5,  # Short evaluation for speed
+                early_stopping_patience=3,
+                save_checkpoints=False,
+                log_interval=100
+            )
+            
+            # Create experiment manager
+            experiment_manager = ExperimentManager(exp_config)
+            
+            # Run training evaluation
+            results = experiment_manager.run_experiment(
+                params, train_data, val_data
+            )
+            
+            # Extract objective metric
+            if self.objective_metric in results.metrics:
+                score = results.metrics[self.objective_metric]
+            elif 'val_loss' in results.metrics:
+                # Use validation loss as fallback (lower is better)
+                score = -results.metrics['val_loss']  # Negate for maximization
+            else:
+                # Use training loss as last resort
+                score = -results.metrics.get('train_loss', 0.0)
+            
+            self.evaluation_history.append({
+                'params': params.copy(),
+                'score': score,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            return float(score)
+            
+        except Exception as e:
+            logging.error(f"Failed to evaluate hyperparameters {params}: {e}")
+            # Return worst possible score
+            return -np.inf if self.maximize else np.inf
+    
+    def _create_training_config(self, params: Dict[str, Any]) -> TrainingConfig:
+        """Create training configuration from hyperparameters."""
+        return TrainingConfig(
+            batch_size=params.get('batch_size', 16),
+            learning_rate=params.get('learning_rate', 1e-4),
+            weight_decay=params.get('weight_decay', 1e-5),
+            warmup_steps=params.get('warmup_steps', 1000),
+            max_steps=5000,  # Short evaluation
+            mixed_precision=True,
+            gradient_clip_norm=1.0,
+            save_every=1000,
+            eval_every=500,
+            log_every=100
+        )
+    
     def optimize(self, train_data: List, val_data: List) -> Dict[str, Any]:
         """Run grid search optimization."""
         logging.info(f"Starting grid search with {len(self.grid_points)} combinations")
@@ -190,6 +253,69 @@ class GridSearchOptimizer(HyperparameterOptimizer):
 
 class RandomSearchOptimizer(HyperparameterOptimizer):
     """Random search hyperparameter optimization."""
+    
+    def evaluate_hyperparameters(self, params: Dict[str, Any], 
+                              train_data: List, val_data: List) -> float:
+        """Evaluate hyperparameters with actual training."""
+        try:
+            # Create training configuration from hyperparameters
+            config = self._create_training_config(params)
+            
+            # Create experiment configuration
+            exp_config = ExperimentConfig(
+                name=f"random_search_{params.get('d_model', 256)}_{params.get('learning_rate', 1e-4)}",
+                description=f"Random search evaluation",
+                max_epochs=5,  # Short evaluation for speed
+                early_stopping_patience=3,
+                save_checkpoints=False,
+                log_interval=100
+            )
+            
+            # Create experiment manager
+            experiment_manager = ExperimentManager(exp_config)
+            
+            # Run training evaluation
+            results = experiment_manager.run_experiment(
+                params, train_data, val_data
+            )
+            
+            # Extract objective metric
+            if self.objective_metric in results.metrics:
+                score = results.metrics[self.objective_metric]
+            elif 'val_loss' in results.metrics:
+                # Use validation loss as fallback (lower is better)
+                score = -results.metrics['val_loss']  # Negate for maximization
+            else:
+                # Use training loss as last resort
+                score = -results.metrics.get('train_loss', 0.0)
+            
+            self.evaluation_history.append({
+                'params': params.copy(),
+                'score': score,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            return float(score)
+            
+        except Exception as e:
+            logging.error(f"Failed to evaluate hyperparameters {params}: {e}")
+            # Return worst possible score
+            return -np.inf if self.maximize else np.inf
+    
+    def _create_training_config(self, params: Dict[str, Any]) -> TrainingConfig:
+        """Create training configuration from hyperparameters."""
+        return TrainingConfig(
+            batch_size=params.get('batch_size', 16),
+            learning_rate=params.get('learning_rate', 1e-4),
+            weight_decay=params.get('weight_decay', 1e-5),
+            warmup_steps=params.get('warmup_steps', 1000),
+            max_steps=5000,  # Short evaluation
+            mixed_precision=True,
+            gradient_clip_norm=1.0,
+            save_every=1000,
+            eval_every=500,
+            log_every=100
+        )
     
     def optimize(self, train_data: List, val_data: List) -> Dict[str, Any]:
         """Run random search optimization."""
@@ -240,6 +366,69 @@ class BayesianOptimizer(HyperparameterOptimizer):
         super().__init__(space, **kwargs)
         self.acquisition_function = 'ei'  # Expected Improvement
         self.observations = []
+    
+    def evaluate_hyperparameters(self, params: Dict[str, Any], 
+                              train_data: List, val_data: List) -> float:
+        """Evaluate hyperparameters with actual training."""
+        try:
+            # Create training configuration from hyperparameters
+            config = self._create_training_config(params)
+            
+            # Create experiment configuration
+            exp_config = ExperimentConfig(
+                name=f"bayesian_search_{params.get('d_model', 256)}_{params.get('learning_rate', 1e-4)}",
+                description=f"Bayesian optimization evaluation",
+                max_epochs=5,  # Short evaluation for speed
+                early_stopping_patience=3,
+                save_checkpoints=False,
+                log_interval=100
+            )
+            
+            # Create experiment manager
+            experiment_manager = ExperimentManager(exp_config)
+            
+            # Run training evaluation
+            results = experiment_manager.run_experiment(
+                params, train_data, val_data
+            )
+            
+            # Extract objective metric
+            if self.objective_metric in results.metrics:
+                score = results.metrics[self.objective_metric]
+            elif 'val_loss' in results.metrics:
+                # Use validation loss as fallback (lower is better)
+                score = -results.metrics['val_loss']  # Negate for maximization
+            else:
+                # Use training loss as last resort
+                score = -results.metrics.get('train_loss', 0.0)
+            
+            self.evaluation_history.append({
+                'params': params.copy(),
+                'score': score,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            return float(score)
+            
+        except Exception as e:
+            logging.error(f"Failed to evaluate hyperparameters {params}: {e}")
+            # Return worst possible score
+            return -np.inf if self.maximize else np.inf
+    
+    def _create_training_config(self, params: Dict[str, Any]) -> TrainingConfig:
+        """Create training configuration from hyperparameters."""
+        return TrainingConfig(
+            batch_size=params.get('batch_size', 16),
+            learning_rate=params.get('learning_rate', 1e-4),
+            weight_decay=params.get('weight_decay', 1e-5),
+            warmup_steps=params.get('warmup_steps', 1000),
+            max_steps=5000,  # Short evaluation
+            mixed_precision=True,
+            gradient_clip_norm=1.0,
+            save_every=1000,
+            eval_every=500,
+            log_every=100
+        )
     
     def _acquisition_function(self, mean, std, best_y):
         """Expected Improvement acquisition function."""

@@ -445,56 +445,71 @@ class NeuralRescoringNetwork(nn.Module):
 
 
 class TorsionStrainCalculator:
-    """Real torsion strain calculation."""
+    """Calculate torsion strain in RNA structures."""
     
     def __init__(self):
         """Initialize torsion strain calculator."""
-        pass
+        self.ideal_bond_angles = {
+            'C3\'-O3\'-P': 109.5,  # degrees
+            'O3\'-P-O5\'': 109.5,
+            'P-O5\'-C5\'': 109.5,
+            'O5\'-C5\'-C4\'': 109.5,
+            'C5\'-C4\'-C3\'': 109.5,
+            'C4\'-C3\'-O3\'': 109.5
+        }
+        self.ideal_dihedral_ranges = {
+            'alpha': (-180, 180),  # O3\'-P-O5\'-C5\'
+            'beta': (-180, 180),   # P-O5\'-C5\'-C4\'
+            'gamma': (-180, 180),  # O5\'-C5\'-C4\'-C3\'
+            'delta': (-180, 180),   # C5\'-C4\'-C3\'-O3\'
+            'epsilon': (-180, 180), # C4\'-C3\'-O3\'-P
+            'zeta': (-180, 180),    # C3\'-O3\'-P-O5\'
+            'chi': (-180, 180)      # Base-specific
+        }
     
     def compute_torsion_variance(self, coords: np.ndarray) -> float:
         """
-        Compute torsion strain variance.
+        Compute torsion angle variance as strain metric.
         
         Args:
-            coords: Structure coordinates
-        
+            coords: Coordinate array of shape (n_atoms, 3)
+            
         Returns:
-            Torsion strain variance
+            Torsion variance score
         """
-        n_residues = len(coords)
-        torsion_angles = []
-        
-        # Compute backbone torsion angles
-        for i in range(1, n_residues - 2):
-            # Four consecutive atoms for dihedral angle
-            if i + 2 < n_residues:
-                v1 = coords[i-1] - coords[i]
-                v2 = coords[i+1] - coords[i]
-                v3 = coords[i+2] - coords[i+1]
+        try:
+            n_atoms = len(coords)
+            if n_atoms < 4:
+                return 0.0
+            
+            # Calculate all possible torsion angles
+            torsion_angles = []
+            
+            # Backbone torsion angles (simplified for general coordinates)
+            for i in range(n_atoms - 3):
+                # Get four consecutive atoms
+                p1, p2, p3, p4 = coords[i], coords[i+1], coords[i+2], coords[i+3]
                 
-                # Compute dihedral angle
-                if np.linalg.norm(v1) > 0 and np.linalg.norm(v2) > 0 and np.linalg.norm(v3) > 0:
-                    # Normalized vectors
-                    n1 = np.cross(v1, v2)
-                    n1 = n1 / np.linalg.norm(n1)
-                    
-                    n2 = np.cross(v2, v3)
-                    n2 = n2 / np.linalg.norm(n2)
-                    
-                    # Dihedral angle
-                    m1 = np.cross(n1, v2 / np.linalg.norm(v2))
-                    x = np.dot(n1, n2)
-                    y = np.dot(m1, n2)
-                    
-                    angle = np.arctan2(y, x)
-                    torsion_angles.append(angle)
-        
-        if len(torsion_angles) == 0:
+                # Calculate dihedral angle
+                dihedral = self._calculate_dihedral(p1, p2, p3, p4)
+                if dihedral is not None:
+                    torsion_angles.append(dihedral)
+            
+            if len(torsion_angles) == 0:
+                return 0.0
+            
+            # Compute variance
+            torsion_array = np.array(torsion_angles)
+            variance = np.var(torsion_array)
+            
+            # Normalize by expected range (360 degrees)
+            normalized_variance = variance / (360.0 ** 2)
+            
+            return float(normalized_variance)
+            
+        except Exception as e:
+            logging.warning(f"Error computing torsion variance: {e}")
             return 0.0
-        
-        # Compute variance
-        torsion_variance = np.var(torsion_angles)
-        return torsion_variance
 
 
 class RelaxerRescoringSystem:

@@ -2,6 +2,7 @@
 
 """RNA 3D Folding Pipeline - Core Architecture"""
 
+import os
 import torch
 import torch.nn as nn
 from pathlib import Path
@@ -32,6 +33,9 @@ class RNAFoldingPipeline:
         self.config = config
         self.logger = setup_logging("rna_folding")
         
+        # Set device
+        self.device = torch.device(config.device)
+        
         # Initialize components
         self.language_model = RNALanguageModel(config.lm_config)
         self.secondary_structure = SecondaryStructurePredictor(config.ss_config)
@@ -39,6 +43,14 @@ class RNAFoldingPipeline:
         self.geometry_module = GeometryModule(config.geometry_config)
         self.sampler = RNASampler(config.sampler_config)
         self.refiner = GeometryRefiner(config.refinement_config)
+        
+        # Move models to device
+        self.language_model.to(self.device)
+        self.secondary_structure.to(self.device)
+        self.structure_encoder.to(self.device)
+        self.geometry_module.to(self.device)
+        self.sampler.to(self.device)
+        self.refiner.to(self.device)
         
         self.logger.info("RNA 3D folding pipeline initialized")
     
@@ -67,25 +79,48 @@ class RNAFoldingPipeline:
         
         try:
             # Tokenize sequence
-            tokens = self._tokenize_sequence(sequence)
+            try:
+                tokens = self._tokenize_sequence(sequence)
+            except Exception as e:
+                self.logger.error(f"Tokenization failed: {e}")
+                return {"sequence": sequence, "error": f"Tokenization failed: {e}", "success": False}
             
             # Language model forward pass
-            lm_outputs = self.language_model(tokens)
+            try:
+                lm_outputs = self.language_model(tokens)
+            except torch.cuda.OutOfMemoryError as e:
+                self.logger.error(f"GPU out of memory in language model: {e}")
+                return {"sequence": sequence, "error": "GPU out of memory", "success": False}
+            except Exception as e:
+                self.logger.error(f"Language model failed: {e}")
+                return {"sequence": sequence, "error": f"Language model failed: {e}", "success": False}
             
             # Secondary structure prediction
-            ss_outputs = self.secondary_structure(lm_outputs["embeddings"])
+            try:
+                ss_outputs = self.secondary_structure(lm_outputs["embeddings"])
+            except Exception as e:
+                self.logger.warning(f"Secondary structure prediction failed: {e}, proceeding without it")
+                ss_outputs = {"contacts": torch.zeros(len(sequence), len(sequence))}
             
             # Structure encoding
-            struct_outputs = self.structure_encoder(
-                lm_outputs["embeddings"], 
-                ss_outputs["contacts"]
-            )
+            try:
+                struct_outputs = self.structure_encoder(
+                    lm_outputs["embeddings"], 
+                    ss_outputs["contacts"]
+                )
+            except Exception as e:
+                self.logger.error(f"Structure encoding failed: {e}")
+                return {"sequence": sequence, "error": f"Structure encoding failed: {e}", "success": False}
             
             # Geometry module
-            geometry_outputs = self.geometry_module(
-                struct_outputs["embeddings"],
-                struct_outputs["pairwise_repr"]
-            )
+            try:
+                geometry_outputs = self.geometry_module(
+                    struct_outputs["embeddings"],
+                    struct_outputs["pairwise_repr"]
+                )
+            except Exception as e:
+                self.logger.error(f"Geometry module failed: {e}")
+                return {"sequence": sequence, "error": f"Geometry module failed: {e}", "success": False}
             
             # Generate decoys
             try:
@@ -96,9 +131,12 @@ class RNAFoldingPipeline:
                     return_all_decoys=return_all_decoys
                 )
                 self.logger.debug(f"Generated {len(decoys)} decoys in {metrics.total_time:.2f}s")
+            except torch.cuda.OutOfMemoryError as e:
+                self.logger.error(f"GPU out of memory during decoy generation: {e}")
+                return {"sequence": sequence, "error": "GPU out of memory during decoy generation", "success": False}
             except Exception as e:
                 self.logger.error(f"Error generating decoys: {e}")
-                raise RuntimeError(f"Failed to generate decoys for sequence {sequence[:20]}...: {e}")
+                return {"sequence": sequence, "error": f"Failed to generate decoys: {e}", "success": False}
             
             # Refinement
             refined_decoys = []
@@ -121,12 +159,19 @@ class RNAFoldingPipeline:
                         "decoy_id": decoy["decoy_id"]
                     })
             
+            # Calculate confidence from model outputs
+            try:
+                confidence = self._calculate_confidence(refined_decoys, geometry_outputs)
+            except Exception as e:
+                self.logger.warning(f"Confidence calculation failed: {e}, using default")
+                confidence = 0.5
+            
             result = {
                 "sequence": sequence,
                 "n_residues": len(sequence),
                 "n_decoys": len(refined_decoys),
                 "coordinates": refined_decoys[0]["coordinates"] if refined_decoys else None,
-                "confidence": 0.8,  # Default confidence
+                "confidence": confidence,
                 "success": True,
                 "decoys": refined_decoys if return_all_decoys else refined_decoys[:5]
             }
@@ -134,18 +179,21 @@ class RNAFoldingPipeline:
             self.logger.info(f"Successfully predicted structure for {sequence}")
             return result
             
+        except torch.cuda.OutOfMemoryError as e:
+            self.logger.error(f"GPU out of memory: {e}")
+            return {"sequence": sequence, "error": "GPU out of memory", "success": False}
         except Exception as e:
-            self.logger.error(f"Failed to predict structure: {e}")
+            self.logger.error(f"Unexpected error during prediction: {e}")
             return {
                 "sequence": sequence,
-                "error": str(e),
+                "error": f"Unexpected error: {e}",
                 "success": False
             }
     
     def _tokenize_sequence(self, sequence: str) -> Dict[str, int]:
         """Tokenize RNA sequence."""
         token_map = {'A': 0, 'U': 1, 'G': 2, 'C': 3, 'N': 4}
-        tokens = [token_map.get(nuc, 4) for nucleotide in sequence.upper()]
+        tokens = [token_map.get(nuc, 4) for nuc in sequence.upper()]
         return {"tokens": tokens, "length": len(tokens)}
     
     def predict_batch(self, sequences: List[str], return_all_decoys: bool = False) -> List[Dict[str, Any]]:
@@ -188,71 +236,78 @@ class RNAFoldingPipeline:
             
             valid_sequences.append((i, sequence))
         
-        # Process valid sequences in batch
+        # Process valid sequences in optimized batch
         batch_results = []
         if valid_sequences:
             try:
-                # Tokenize all sequences at once
-                max_len = max(len(seq) for _, seq in valid_sequences)
-                batch_tokens = torch.zeros(len(valid_sequences), max_len, dtype=torch.long, device=self.device)
+                # Create batch processing data structures
+                sequences_data = [(orig_idx, sequence) for orig_idx, sequence in valid_sequences]
+                max_len = max(len(seq) for _, seq in sequences_data)
+                batch_size = len(sequences_data)
                 
-                for batch_idx, (_, sequence) in enumerate(valid_sequences):
+                # Batch tokenize all sequences efficiently
+                batch_tokens = torch.zeros(batch_size, max_len, dtype=torch.long, device=self.device)
+                sequence_lengths = []
+                
+                for batch_idx, (_, sequence) in enumerate(sequences_data):
                     token_dict = self._tokenize_sequence(sequence)
                     tokens = token_dict["tokens"]
                     batch_tokens[batch_idx, :len(tokens)] = tokens
+                    sequence_lengths.append(len(tokens))
                 
-                # Forward pass for batch
-                lm_outputs = self.language_model(batch_tokens)
+                # Create attention mask for variable length sequences
+                attention_mask = torch.arange(max_len, device=self.device).unsqueeze(0) < torch.tensor(sequence_lengths, device=self.device).unsqueeze(1)
                 
-                # Process each sequence individually for now (can be further optimized)
-                for orig_idx, sequence in valid_sequences:
-                    seq_idx = next(i for i, (idx, _) in enumerate(valid_sequences) if idx == orig_idx)
-                    seq_tokens = batch_tokens[seq_idx:seq_idx+1]
-                    seq_embeddings = {k: v[seq_idx:seq_idx+1] for k, v in lm_outputs.items()}
+                # Batch forward pass through language model
+                lm_outputs = self.language_model(batch_tokens, attention_mask)
+                batch_embeddings = lm_outputs["embeddings"]
+                
+                # Batch secondary structure prediction
+                ss_outputs = self.secondary_structure(batch_embeddings)
+                
+                # Batch structure encoding
+                struct_outputs = self.structure_encoder(batch_embeddings, ss_outputs["contacts"])
+                
+                # Batch geometry processing
+                geometry_outputs = self.geometry_module(struct_outputs["embeddings"], struct_outputs["pairwise_repr"])
+                
+                # Process individual sequences for sampling and refinement (these are inherently sequential)
+                for i, (orig_idx, sequence) in enumerate(sequences_data):
+                    seq_len = sequence_lengths[i]
+                    seq_embeddings = {k: v[i:i+1, :seq_len] for k, v in lm_outputs.items()}
+                    seq_geometry = {k: v[i:i+1, :seq_len] if hasattr(v, 'shape') and len(v.shape) > 1 else v 
+                                 for k, v in geometry_outputs.items()}
                     
-                    # Rest of pipeline processing
-                    ss_outputs = self.secondary_structure(seq_embeddings["embeddings"])
-                    struct_outputs = self.structure_encoder(seq_embeddings["embeddings"], ss_outputs["contacts"])
-                    geometry_outputs = self.geometry_module(struct_outputs["embeddings"], struct_outputs["pairwise_repr"])
-                    
-                    # Generate decoys
-                    decoys, metrics = self.sampler.generate_decoys(
-                        sequence, seq_embeddings["embeddings"], geometry_outputs["coordinates"],
-                        return_all_decoys=return_all_decoys
-                    )
-                    
-                    # Refinement
-                    refined_decoys = []
-                    for decoy in decoys:
-                        try:
-                            refined = self.refiner.refine_structure(decoy["coordinates"])
-                            refined_decoys.append({
-                                "coordinates": refined["coordinates"],
-                                "confidence": refined["loss"],
-                                "refined": True,
-                                "original_confidence": decoy["confidence"],
-                                "decoy_id": decoy["decoy_id"]
-                            })
-                        except Exception as e:
-                            self.logger.warning(f"Refinement failed, using original: {e}")
-                            refined_decoys.append({
-                                "coordinates": decoy["coordinates"],
-                                "confidence": decoy["confidence"],
-                                "refined": False,
-                                "decoy_id": decoy["decoy_id"]
-                            })
-                    
-                    batch_results.append({
-                        "sequence": sequence,
-                        "n_residues": len(sequence),
-                        "n_decoys": len(refined_decoys),
-                        "coordinates": refined_decoys[0]["coordinates"] if refined_decoys else None,
-                        "confidence": 0.8,
-                        "success": True,
-                        "decoys": refined_decoys if return_all_decoys else refined_decoys[:5],
-                        "batch_index": orig_idx,
-                        "metrics": metrics
-                    })
+                    try:
+                        # Generate decoys for this sequence
+                        decoys, metrics = self.sampler.generate_decoys(
+                            sequence, seq_embeddings["embeddings"], seq_geometry["coordinates"],
+                            return_all_decoys=return_all_decoys
+                        )
+                        
+                        # Batch refinement for all decoys of this sequence
+                        refined_decoys = self._batch_refine_decoys(decoys)
+                        
+                        batch_results.append({
+                            "sequence": sequence,
+                            "n_residues": len(sequence),
+                            "n_decoys": len(refined_decoys),
+                            "coordinates": refined_decoys[0]["coordinates"] if refined_decoys else None,
+                            "confidence": 0.8,
+                            "success": True,
+                            "decoys": refined_decoys if return_all_decoys else refined_decoys[:5],
+                            "batch_index": orig_idx,
+                            "metrics": metrics
+                        })
+                        
+                    except Exception as e:
+                        self.logger.error(f"Failed to process sequence {orig_idx}: {e}")
+                        batch_results.append({
+                            "sequence": sequence,
+                            "error": str(e),
+                            "success": False,
+                            "batch_index": orig_idx
+                        })
                     
             except Exception as e:
                 self.logger.error(f"Batch processing failed: {e}")
@@ -269,13 +324,123 @@ class RNAFoldingPipeline:
         self.logger.info(f"Batch processing complete: {len(all_results)} results")
         return all_results
     
+    def _calculate_confidence(self, refined_decoys: List[Dict], geometry_outputs: Dict) -> float:
+        """Calculate confidence score from model outputs and decoy consistency."""
+        if not refined_decoys:
+            return 0.0
+        
+        # Base confidence from geometry module
+        base_confidence = 0.0
+        if "confidence" in geometry_outputs:
+            base_confidence = geometry_outputs["confidence"].mean().item() if hasattr(geometry_outputs["confidence"], 'mean') else 0.8
+        else:
+            base_confidence = 0.8  # Default fallback
+        
+        # Adjust based on decoy consistency
+        decoy_confidences = [decoy.get("confidence", 0.5) for decoy in refined_decoys]
+        if decoy_confidences:
+            mean_confidence = sum(decoy_confidences) / len(decoy_confidences)
+            confidence_variance = sum((c - mean_confidence) ** 2 for c in decoy_confidences) / len(decoy_confidences)
+            
+            # Higher variance reduces confidence
+            consistency_factor = 1.0 - min(confidence_variance, 1.0)
+        else:
+            consistency_factor = 0.5
+        
+        # Adjust based on number of successful refinements
+        refined_count = sum(1 for decoy in refined_decoys if decoy.get("refined", False))
+        refinement_factor = refined_count / len(refined_decoys) if refined_decoys else 0.5
+        
+        # Combine factors
+        final_confidence = base_confidence * consistency_factor * refinement_factor
+        
+        # Ensure confidence is in valid range
+        return max(0.0, min(1.0, final_confidence))
+    
+    def _batch_refine_decoys(self, decoys: List[Dict]) -> List[Dict]:
+        """Batch refine multiple decoys efficiently."""
+        if not decoys:
+            return []
+        
+        refined_decoys = []
+        
+        # Stack coordinates for batch processing
+        coords_list = [decoy["coordinates"] for decoy in decoys]
+        stacked_coords = torch.stack(coords_list) if all(isinstance(c, torch.Tensor) for c in coords_list) else None
+        
+        if stacked_coords is not None:
+            try:
+                # Batch refinement
+                batch_refined = self.refiner.refine_structure(stacked_coords)
+                
+                # Extract individual results
+                for i, decoy in enumerate(decoys):
+                    refined_coords = batch_refined["refined_coordinates"][i] if batch_refined["refined_coordinates"].dim() > 0 else batch_refined["refined_coordinates"]
+                    refined_decoys.append({
+                        "coordinates": refined_coords,
+                        "confidence": batch_refined["final_loss"] if isinstance(batch_refined["final_loss"], (int, float)) else batch_refined["final_loss"][i],
+                        "refined": True,
+                        "original_confidence": decoy["confidence"],
+                        "decoy_id": decoy["decoy_id"]
+                    })
+            except (RuntimeError, torch.cuda.OutOfMemoryError, ValueError) as e:
+                self.logger.warning(f"Batch refinement failed ({type(e).__name__}), falling back to individual: {e}")
+                # Fall back to individual processing
+                for decoy in decoys:
+                    try:
+                        refined = self.refiner.refine_structure(decoy["coordinates"])
+                        refined_decoys.append({
+                            "coordinates": refined["coordinates"],
+                            "confidence": refined["loss"],
+                            "refined": True,
+                            "original_confidence": decoy["confidence"],
+                            "decoy_id": decoy["decoy_id"]
+                        })
+                    except (RuntimeError, ValueError, KeyError) as e2:
+                        self.logger.warning(f"Individual refinement failed for decoy {decoy['decoy_id']} ({type(e2).__name__}): {e2}")
+                        refined_decoys.append({
+                            "coordinates": decoy["coordinates"],
+                            "confidence": decoy["confidence"],
+                            "refined": False,
+                            "decoy_id": decoy["decoy_id"]
+                        })
+        else:
+            # Individual processing for mixed tensor types
+            for decoy in decoys:
+                try:
+                    refined = self.refiner.refine_structure(decoy["coordinates"])
+                    refined_decoys.append({
+                        "coordinates": refined["coordinates"],
+                        "confidence": refined["loss"],
+                        "refined": True,
+                        "original_confidence": decoy["confidence"],
+                        "decoy_id": decoy["decoy_id"]
+                    })
+                except (RuntimeError, ValueError, KeyError, AttributeError) as e:
+                    self.logger.warning(f"Refinement failed for decoy {decoy['decoy_id']} ({type(e).__name__}), using original: {e}")
+                    refined_decoys.append({
+                        "coordinates": decoy["coordinates"],
+                        "confidence": decoy["confidence"],
+                        "refined": False,
+                        "decoy_id": decoy["decoy_id"]
+                    })
+        
+        return refined_decoys
+    
     def load_model(self, model_path: str, device: str = "auto") -> bool:
-        """Load model from checkpoint with security validation."""
+        """Load model from checkpoint with comprehensive security validation."""
         # Input validation
         if not model_path or not isinstance(model_path, str):
             raise ValueError("Model path must be a non-empty string")
         
-        model_path = Path(model_path)
+        # Path traversal protection
+        model_path = Path(model_path).resolve()
+        try:
+            # Ensure path is within expected bounds (prevent directory traversal)
+            model_path.relative_to(Path.cwd())
+        except ValueError:
+            raise ValueError(f"Path traversal detected: {model_path}")
+        
         if not model_path.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
         
@@ -287,56 +452,38 @@ class RNAFoldingPipeline:
         if file_size > 10 * 1024 * 1024 * 1024:  # 10GB limit
             raise ValueError(f"Model file too large: {file_size / (1024**3):.1f}GB")
         
+        # Additional security: check file permissions
+        if model_path.is_file() and not os.access(model_path, os.R_OK):
+            raise PermissionError(f"No read permission for model file: {model_path}")
+        
         try:
-            # Load with weights_only=True for security
-            checkpoint = torch.load(model_path, map_location=self.config.device, weights_only=True)
+            # Enhanced security loading
+            try:
+                # First attempt with maximum security
+                checkpoint = torch.load(model_path, map_location=self.config.device, weights_only=True)
+            except (RuntimeError, pickle.UnpicklingError) as e:
+                # Fallback with additional validation if weights_only fails
+                self.logger.warning(f"weights_only loading failed, attempting with validation: {e}")
+                checkpoint = self._secure_load_checkpoint(model_path)
             
             # Comprehensive checkpoint validation
             if not isinstance(checkpoint, dict):
                 raise ValueError("Checkpoint must be a dictionary")
             
-            # Validate checkpoint structure
-            required_keys = ['language_model', 'secondary_structure', 'structure_encoder', 'geometry_module']
-            missing_keys = [key for key in required_keys if key not in checkpoint]
-            if missing_keys:
-                raise KeyError(f"Missing required keys in checkpoint: {missing_keys}")
+            # Validate checkpoint structure and metadata
+            self._validate_checkpoint_structure(checkpoint)
             
-            # Validate each model state dict
-            for model_name in required_keys:
-                state_dict = checkpoint[model_name]
-                if not isinstance(state_dict, dict):
-                    raise ValueError(f"State dict for {model_name} must be a dictionary")
-                
-                # Check for suspicious keys (potential security risk)
-                suspicious_keys = ['__builtins__', '__import__', 'eval', 'exec', 'compile']
-                for key in state_dict.keys():
-                    if any(suspicious in key.lower() for suspicious in suspicious_keys):
-                        raise ValueError(f"Suspicious key found in {model_name} state dict: {key}")
-                
-                # Validate tensor shapes and types
-                for param_name, param_tensor in state_dict.items():
-                    if not isinstance(param_tensor, torch.Tensor):
-                        raise ValueError(f"Parameter {param_name} in {model_name} is not a tensor")
-                    
-                    # Check for reasonable tensor sizes
-                    if param_tensor.numel() > 1e9:  # > 1GB tensor
-                        raise ValueError(f"Parameter {param_name} in {model_name} is too large: {param_tensor.numel()} elements")
+            # Validate each model state dict for security
+            self._validate_model_state_dicts(checkpoint)
             
-            # Load state dictionaries with validation
-            self.language_model.load_state_dict(checkpoint['language_model'], strict=True)
-            self.secondary_structure.load_state_dict(checkpoint['secondary_structure'], strict=True)
-            self.structure_encoder.load_state_dict(checkpoint['structure_encoder'], strict=True)
-            self.geometry_module.load_state_dict(checkpoint['geometry_module'], strict=True)
+            # Load state dictionaries with error handling
+            self._load_model_states(checkpoint)
             
             # Set models to eval mode for inference
-            self.language_model.eval()
-            self.secondary_structure.eval()
-            self.structure_encoder.eval()
-            self.geometry_module.eval()
-            self.sampler.eval()
-            self.refiner.eval()
+            self._set_eval_mode()
             
             self.logger.info(f"Model loaded successfully from {model_path}")
+            return True
             
         except torch.serialization.pickle.UnpicklingError as e:
             self.logger.error(f"Corrupted model file: {e}")
@@ -344,6 +491,156 @@ class RNAFoldingPipeline:
         except Exception as e:
             self.logger.error(f"Failed to load model: {e}")
             raise
+    
+    def _secure_load_checkpoint(self, model_path: Path) -> dict:
+        """Secure checkpoint loading with additional validation."""
+        import pickle
+        import tempfile
+        import hashlib
+        
+        # Calculate file hash for integrity check
+        file_hash = hashlib.sha256()
+        with open(model_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                file_hash.update(chunk)
+        
+        # Load in a controlled environment
+        with tempfile.NamedTemporaryFile(delete=True) as temp_file:
+            # Copy file to temporary location
+            import shutil
+            shutil.copy2(model_path, temp_file.name)
+            
+            # Load with restricted pickle environment
+            class SafeUnpickler(pickle.Unpickler):
+                def find_class(self, module, name):
+                    # Only allow safe classes from specific modules
+                    allowed_modules = {
+                        'torch', 'torch._utils', 'collections', 'builtins',
+                        'numpy', 'numpy.core.multiarray'
+                    }
+                    allowed_classes = {
+                        'OrderedDict', 'dict', 'list', 'tuple', 'set', 'frozenset',
+                        'int', 'float', 'str', 'bool', 'bytes', 'bytearray'
+                    }
+                    
+                    if module in allowed_modules and name in allowed_classes:
+                        return super().find_class(module, name)
+                    raise pickle.UnpicklingError(f"Unsafe class {module}.{name}")
+                
+                def load(self):
+                    # Additional validation during loading
+                    data = super().load()
+                    if not isinstance(data, dict):
+                        raise pickle.UnpicklingError("Checkpoint must be a dictionary")
+                    return data
+            
+            try:
+                with open(temp_file.name, 'rb') as f:
+                    checkpoint = SafeUnpickler(f).load()
+                
+                # Verify checkpoint structure
+                required_keys = {'language_model', 'secondary_structure', 'structure_encoder', 'geometry_module'}
+                missing_keys = required_keys - set(checkpoint.keys())
+                if missing_keys:
+                    raise ValueError(f"Missing required keys in checkpoint: {missing_keys}")
+                
+                # Validate tensor data types
+                for key, value in checkpoint.items():
+                    if isinstance(value, dict):
+                        for sub_key, sub_value in value.items():
+                            if hasattr(sub_value, 'dtype'):
+                                # Check for reasonable tensor data types
+                                if sub_value.dtype not in [torch.float32, torch.float64, torch.float16, torch.int32, torch.int64]:
+                                    raise ValueError(f"Invalid tensor dtype in {key}.{sub_key}: {sub_value.dtype}")
+                
+                return checkpoint
+                
+            except Exception as e:
+                raise ValueError(f"Failed to load checkpoint securely: {e}")
+    
+    def _validate_checkpoint_structure(self, checkpoint: dict) -> None:
+        """Validate checkpoint structure and metadata."""
+        # Check for required keys
+        required_keys = ['language_model', 'secondary_structure', 'structure_encoder', 'geometry_module']
+        missing_keys = [key for key in required_keys if key not in checkpoint]
+        if missing_keys:
+            raise KeyError(f"Missing required keys in checkpoint: {missing_keys}")
+        
+        # Validate metadata if present
+        if 'metadata' in checkpoint:
+            metadata = checkpoint['metadata']
+            if not isinstance(metadata, dict):
+                raise ValueError("Checkpoint metadata must be a dictionary")
+            
+            # Check version compatibility
+            if 'version' in metadata:
+                version = metadata['version']
+                if not isinstance(version, str):
+                    raise ValueError("Checkpoint version must be a string")
+        
+        # Check for suspicious top-level keys
+        suspicious_keys = ['__builtins__', '__import__', 'eval', 'exec', 'compile', '__code__']
+        for key in checkpoint.keys():
+            if any(suspicious in key.lower() for suspicious in suspicious_keys):
+                raise ValueError(f"Suspicious key found in checkpoint: {key}")
+    
+    def _validate_model_state_dicts(self, checkpoint: dict) -> None:
+        """Validate individual model state dictionaries."""
+        required_keys = ['language_model', 'secondary_structure', 'structure_encoder', 'geometry_module']
+        
+        for model_name in required_keys:
+            state_dict = checkpoint[model_name]
+            if not isinstance(state_dict, dict):
+                raise ValueError(f"State dict for {model_name} must be a dictionary")
+            
+            # Check for suspicious keys
+            suspicious_keys = ['__builtins__', '__import__', 'eval', 'exec', 'compile', '__code__']
+            for key in state_dict.keys():
+                if any(suspicious in key.lower() for suspicious in suspicious_keys):
+                    raise ValueError(f"Suspicious key found in {model_name} state dict: {key}")
+            
+            # Validate tensor properties
+            self._validate_tensor_properties(state_dict, model_name)
+    
+    def _validate_tensor_properties(self, state_dict: dict, model_name: str) -> None:
+        """Validate tensor properties in state dict."""
+        for param_name, param_tensor in state_dict.items():
+            if not isinstance(param_tensor, torch.Tensor):
+                raise ValueError(f"Parameter {param_name} in {model_name} is not a tensor")
+            
+            # Check for reasonable tensor sizes
+            if param_tensor.numel() > 1e9:  # > 1GB tensor
+                raise ValueError(f"Parameter {param_name} in {model_name} is too large: {param_tensor.numel()} elements")
+            
+            # Check for NaN or Inf values
+            if torch.isnan(param_tensor).any() or torch.isinf(param_tensor).any():
+                raise ValueError(f"Parameter {param_name} in {model_name} contains NaN or Inf values")
+            
+            # Check tensor dtype is reasonable
+            valid_dtypes = [torch.float32, torch.float64, torch.float16, torch.bfloat16, torch.int8, torch.int16, torch.int32, torch.int64]
+            if param_tensor.dtype not in valid_dtypes:
+                raise ValueError(f"Parameter {param_name} in {model_name} has invalid dtype: {param_tensor.dtype}")
+    
+    def _load_model_states(self, checkpoint: dict) -> None:
+        """Load model states with error handling."""
+        required_keys = ['language_model', 'secondary_structure', 'structure_encoder', 'geometry_module']
+        
+        for model_name in required_keys:
+            try:
+                model = getattr(self, model_name)
+                model.load_state_dict(checkpoint[model_name], strict=True)
+            except AttributeError:
+                raise ValueError(f"Model {model_name} not found in pipeline")
+            except RuntimeError as e:
+                raise ValueError(f"Failed to load state dict for {model_name}: {e}")
+    
+    def _set_eval_mode(self) -> None:
+        """Set all models to evaluation mode."""
+        models = [self.language_model, self.secondary_structure, self.structure_encoder, 
+                 self.geometry_module, self.sampler, self.refiner]
+        
+        for model in models:
+            model.eval()
 
 # Configuration class
 class PipelineConfig:

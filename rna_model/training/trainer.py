@@ -8,29 +8,40 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 from dataclasses import dataclass
 import time
+import sys
+import logging
+import hashlib
 from pathlib import Path
+
+from ..core.constants import MODEL, LOGGING, COMPETITION
 
 from ..models.language_model import RNALanguageModel, masked_span_loss, contact_loss
 from ..models.secondary_structure import SecondaryStructurePredictor, secondary_structure_loss
+from ..models.integrated import IntegratedModel
 from ..core.geometry_module import GeometryModule, geometry_loss, fape_loss
-# Import PipelineConfig locally to avoid circular imports
 from ..core.utils import set_seed, clear_cache, memory_usage
-import json
 
 
 @dataclass
 class TrainingConfig:
     """Training configuration."""
     # Data
-    batch_size: int = 8
+    batch_size: int = MODEL.DEFAULT_BATCH_SIZE
     num_workers: int = 4
     pin_memory: bool = True
     
+    # Model architecture constants
+    DEFAULT_D_MODEL: int = MODEL.DEFAULT_D_MODEL
+    DEFAULT_N_LAYERS: int = MODEL.DEFAULT_N_LAYERS
+    DEFAULT_N_HEADS: int = MODEL.DEFAULT_N_HEADS
+    DEFAULT_D_FF: int = MODEL.DEFAULT_D_FF
+    DEFAULT_MAX_SEQ_LEN: int = MODEL.DEFAULT_MAX_SEQ_LEN
+    
     # Optimization
-    learning_rate: float = 1e-4
-    weight_decay: float = 1e-5
+    learning_rate: float = MODEL.DEFAULT_LEARNING_RATE
+    weight_decay: float = MODEL.DEFAULT_WEIGHT_DECAY
     warmup_steps: int = 1000
-    max_steps: int = 100000
+    max_steps: int = MODEL.DEFAULT_MAX_STEPS
     gradient_clip_norm: float = 1.0
     
     # Loss weights
@@ -53,54 +64,302 @@ class TrainingConfig:
     resume_from_checkpoint: Optional[str] = None
     checkpoint_interval: int = 1000  # Save checkpoint every N steps
     max_checkpoints_to_keep: int = 5  # Keep only last N checkpoints
+    
+    # Memory management constants
+    MEMORY_CLEANUP_INTERVAL: int = COMPETITION.MEMORY_CLEANUP_INTERVAL
+    MAX_CACHE_SIZE: int = COMPETITION.MAX_CACHE_SIZE
+    GPU_MEMORY_THRESHOLD: float = COMPETITION.GPU_MEMORY_THRESHOLD
+    memory_threshold_gb: float = 40.0  # Memory threshold for aggressive cleanup
+    
+    # Competition constants
+    DEFAULT_MAX_SEQUENCE_LENGTH: int = COMPETITION.DEFAULT_MAX_SEQUENCE_LENGTH
+    DEFAULT_INFERENCE_TIMEOUT: float = COMPETITION.DEFAULT_INFERENCE_TIMEOUT
+    DEFAULT_TIME_LIMIT_HOURS: float = COMPETITION.DEFAULT_TIME_LIMIT_HOURS
+    
+    def validate(self) -> None:
+        """Validate training configuration parameters."""
+        if self.batch_size <= 0 or self.batch_size > 128:
+            raise ValueError(f"batch_size must be between 1 and 128, got {self.batch_size}")
+        
+        if self.num_workers < 0:
+            raise ValueError(f"num_workers must be non-negative, got {self.num_workers}")
+        
+        if not (1e-6 <= self.learning_rate <= 1e-1):
+            raise ValueError(f"learning_rate must be between 1e-6 and 1e-1, got {self.learning_rate}")
+        
+        if self.weight_decay < 0 or self.weight_decay > 1e-1:
+            raise ValueError(f"weight_decay must be between 0 and 1e-1, got {self.weight_decay}")
+        
+        if self.warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be non-negative, got {self.warmup_steps}")
+        
+        if self.max_steps <= 0:
+            raise ValueError(f"max_steps must be positive, got {self.max_steps}")
+        
+        if self.gradient_clip_norm <= 0:
+            raise ValueError(f"gradient_clip_norm must be positive, got {self.gradient_clip_norm}")
+        
+        if self.accumulate_gradients <= 0:
+            raise ValueError(f"accumulate_gradients must be positive, got {self.accumulate_gradients}")
+        
+        if self.memory_threshold_gb <= 0 or self.memory_threshold_gb > 100:
+            raise ValueError(f"memory_threshold_gb must be between 0 and 100, got {self.memory_threshold_gb}")
+        
+        # Validate loss weights
+        if any(x < 0 for x in [self.lm_loss_weight, self.ss_loss_weight, 
+                              self.geometry_loss_weight, self.fape_loss_weight]):
+            raise ValueError("All loss weights must be non-negative")
+        
+        # Validate intervals
+        if self.checkpoint_interval <= 0 or self.checkpoint_interval > self.max_steps:
+            raise ValueError(f"checkpoint_interval must be between 1 and max_steps, got {self.checkpoint_interval}")
+        
+        if self.save_every <= 0 or self.save_every > self.max_steps:
+            raise ValueError(f"save_every must be between 1 and max_steps, got {self.save_every}")
+        
+        if self.eval_every <= 0 or self.eval_every > self.max_steps:
+            raise ValueError(f"eval_every must be between 1 and max_steps, got {self.eval_every}")
+        
+        if self.log_every <= 0 or self.log_every > self.max_steps:
+            raise ValueError(f"log_every must be between 1 and max_steps, got {self.log_every}")
+        
+        # Validate path
+        if not self.output_dir or not isinstance(self.output_dir, str):
+            raise ValueError("output_dir must be a non-empty string")
+        
+        if self.resume_from_checkpoint and not isinstance(self.resume_from_checkpoint, str):
+            raise ValueError("resume_from_checkpoint must be a string path")
+        
+        # Validate checkpoint parameters
+        if self.max_checkpoints_to_keep <= 0:
+            raise ValueError(f"max_checkpoints_to_keep must be positive, got {self.max_checkpoints_to_keep}")
 
 
 class CheckpointManager:
-    """Manage training checkpoints with automatic cleanup."""
+    """Manage training checkpoints with comprehensive error handling and validation."""
     
-    def __init__(self, checkpoint_dir: Path, max_checkpoints: int = 5):
+    def __init__(self, checkpoint_dir: Path, max_checkpoints: int = None, 
+                 min_disk_space_gb: float = None, checksum_validation: bool = True):
         self.checkpoint_dir = Path(checkpoint_dir)
-        self.max_checkpoints = max_checkpoints
+        self.max_checkpoints = max_checkpoints or LOGGING.DEFAULT_MAX_CHECKPOINTS
+        self.min_disk_space_gb = min_disk_space_gb or LOGGING.MIN_DISK_SPACE_GB
+        self.checksum_validation = checksum_validation
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    def _check_disk_space(self) -> bool:
+        """Check if there's enough disk space for checkpoint saving."""
+        try:
+            import shutil
+            stat = shutil.disk_usage(self.checkpoint_dir)
+            free_space_gb = stat.free / (1024**3)
+            return free_space_gb >= self.min_disk_space_gb
+        except Exception as e:
+            logging.warning(f"Could not check disk space: {e}")
+            return True  # Assume there's enough space if we can't check
+    
+    def _validate_checkpoint_data(self, checkpoint: Dict[str, Any]) -> bool:
+        """Validate checkpoint data integrity."""
+        required_keys = {'step', 'epoch', 'model_state_dict', 'optimizer_state_dict', 'timestamp'}
+        
+        # Check required keys
+        if not all(key in checkpoint for key in required_keys):
+            missing = required_keys - set(checkpoint.keys())
+            logging.error(f"Checkpoint missing required keys: {missing}")
+            return False
+        
+        # Validate data types
+        try:
+            assert isinstance(checkpoint['step'], int) and checkpoint['step'] >= 0
+            assert isinstance(checkpoint['epoch'], int) and checkpoint['epoch'] >= 0
+            assert isinstance(checkpoint['loss'], (int, float)) and checkpoint['loss'] >= 0
+            assert isinstance(checkpoint['timestamp'], (int, float))
+            assert isinstance(checkpoint['model_state_dict'], dict)
+            assert isinstance(checkpoint['optimizer_state_dict'], dict)
+        except (AssertionError, TypeError, ValueError) as e:
+            logging.error(f"Checkpoint data validation failed: {e}")
+            return False
+        
+        return True
+    
+    def _compute_checksum(self, data: Any) -> str:
+        """Compute checksum for checkpoint data."""
+        import json
+        try:
+            # Create a deterministic representation
+            if isinstance(data, dict):
+                # Sort keys for deterministic ordering
+                data_str = json.dumps(data, sort_keys=True, default=str)
+            else:
+                data_str = str(data)
+            return hashlib.sha256(data_str.encode()).hexdigest()
+        except Exception as e:
+            logging.warning(f"Could not compute checksum: {e}")
+            return ""
     
     def save_checkpoint(self, model: nn.Module, optimizer: torch.optim.Optimizer,
                        scheduler: Any, step: int, epoch: int, loss: float,
                        config: Dict[str, Any]) -> Path:
-        """Save training checkpoint."""
+        """Save training checkpoint with comprehensive error handling."""
         checkpoint_path = self.checkpoint_dir / f"checkpoint_step_{step}.pth"
         
-        checkpoint = {
-            'step': step,
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'loss': loss,
-            'config': config,
-            'timestamp': time.time()
-        }
+        # Check disk space first
+        if not self._check_disk_space():
+            raise RuntimeError(f"Insufficient disk space (minimum {self.min_disk_space_gb}GB required)")
         
-        torch.save(checkpoint, checkpoint_path)
+        # Prepare checkpoint data
+        try:
+            checkpoint = {
+                'step': step,
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'loss': float(loss),  # Ensure float for JSON serialization
+                'config': config,
+                'timestamp': time.time(),
+                'pytorch_version': torch.__version__,
+                'python_version': f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+            }
+        except Exception as e:
+            raise RuntimeError(f"Failed to prepare checkpoint data: {e}")
+        
+        # Validate checkpoint data
+        if not self._validate_checkpoint_data(checkpoint):
+            raise RuntimeError("Checkpoint data validation failed")
+        
+        # Add checksum if enabled
+        if self.checksum_validation:
+            checkpoint['checksum'] = self._compute_checksum(checkpoint)
+        
+        # Save with temporary file and atomic rename
+        temp_path = checkpoint_path.with_suffix('.tmp')
+        backup_path = checkpoint_path.with_suffix('.bak')
+        
+        try:
+            # Save to temporary file first
+            torch.save(checkpoint, temp_path)
+            
+            # Verify the saved file
+            if not temp_path.exists() or temp_path.stat().st_size == 0:
+                raise RuntimeError("Temporary checkpoint file is empty or missing")
+            
+            # Verify we can load it back
+            try:
+                loaded = torch.load(temp_path, map_location='cpu')
+                if not self._validate_checkpoint_data(loaded):
+                    raise RuntimeError("Saved checkpoint validation failed")
+            except Exception as e:
+                raise RuntimeError(f"Saved checkpoint verification failed: {e}")
+            
+            # Create backup of existing checkpoint if it exists
+            if checkpoint_path.exists():
+                try:
+                    checkpoint_path.rename(backup_path)
+                except Exception as e:
+                    logging.warning(f"Could not create backup of existing checkpoint: {e}")
+            
+            # Atomic rename
+            temp_path.rename(checkpoint_path)
+            
+            # Remove backup if successful
+            if backup_path.exists():
+                backup_path.unlink()
+            
+            logging.info(f"Successfully saved checkpoint: {checkpoint_path}")
+            
+        except Exception as e:
+            # Cleanup on failure
+            for path in [temp_path, backup_path]:
+                if path.exists():
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+            raise RuntimeError(f"Failed to save checkpoint: {e}")
         
         # Clean up old checkpoints
-        self._cleanup_old_checkpoints()
+        try:
+            self._cleanup_old_checkpoints()
+        except Exception as e:
+            logging.warning(f"Checkpoint cleanup failed: {e}")
         
         return checkpoint_path
     
-    def load_checkpoint(self, checkpoint_path: Path) -> Dict[str, Any]:
-        """Load training checkpoint."""
+    def load_checkpoint(self, checkpoint_path: Path, validate: bool = True) -> Dict[str, Any]:
+        """Load training checkpoint with validation and error recovery."""
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         
-        return torch.load(checkpoint_path, map_location='cpu')
+        # Try backup if main file is corrupted
+        backup_path = checkpoint_path.with_suffix('.bak')
+        paths_to_try = [checkpoint_path]
+        if backup_path.exists():
+            paths_to_try.append(backup_path)
+        
+        last_error = None
+        for path in paths_to_try:
+            try:
+                # Load checkpoint
+                checkpoint = torch.load(path, map_location='cpu')
+                
+                # Validate if requested
+                if validate and not self._validate_checkpoint_data(checkpoint):
+                    raise RuntimeError("Checkpoint validation failed")
+                
+                # Validate checksum if present
+                if (validate and self.checksum_validation and 
+                    'checksum' in checkpoint):
+                    stored_checksum = checkpoint['checksum']
+                    computed_checksum = self._compute_checksum(checkpoint)
+                    if stored_checksum != computed_checksum:
+                        raise RuntimeError("Checkpoint checksum mismatch - data corruption detected")
+                
+                # If we loaded from backup, restore it
+                if path != checkpoint_path:
+                    logging.warning(f"Loaded checkpoint from backup: {path}")
+                    try:
+                        path.rename(checkpoint_path)
+                    except Exception as e:
+                        logging.warning(f"Could not restore backup checkpoint: {e}")
+                
+                logging.info(f"Successfully loaded checkpoint: {checkpoint_path}")
+                return checkpoint
+                
+            except Exception as e:
+                last_error = e
+                logging.warning(f"Failed to load checkpoint from {path}: {e}")
+                continue
+        
+        # If we get here, all attempts failed
+        raise RuntimeError(f"Failed to load checkpoint from all sources. Last error: {last_error}")
     
     def get_latest_checkpoint(self) -> Optional[Path]:
-        """Get path to latest checkpoint."""
+        """Get path to latest checkpoint with validation."""
         checkpoints = list(self.checkpoint_dir.glob("checkpoint_step_*.pth"))
         if not checkpoints:
             return None
         
-        return max(checkpoints, key=lambda p: p.stat().st_mtime)
+        # Sort by modification time and validate
+        checkpoints.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        
+        for checkpoint in checkpoints:
+            try:
+                # Quick validation by checking file size and trying to load metadata
+                if checkpoint.stat().st_size > 0:
+                    # Try to load just the step number without loading full state dict
+                    metadata = torch.load(checkpoint, map_location='cpu')
+                    if isinstance(metadata, dict) and 'step' in metadata:
+                        return checkpoint
+            except Exception as e:
+                logging.warning(f"Invalid checkpoint {checkpoint}: {e}")
+                # Move invalid checkpoint to .corrupted
+                corrupted_path = checkpoint.with_suffix('.corrupted')
+                try:
+                    checkpoint.rename(corrupted_path)
+                except Exception:
+                    pass
+        
+        return None
     
     def _cleanup_old_checkpoints(self):
         """Remove old checkpoints, keeping only the most recent ones."""
@@ -112,9 +371,43 @@ class CheckpointManager:
         # Sort by modification time and remove oldest
         checkpoints.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         
+        removed_count = 0
         for checkpoint in checkpoints[self.max_checkpoints:]:
-            checkpoint.unlink()
-            logging.info(f"Removed old checkpoint: {checkpoint}")
+            try:
+                checkpoint.unlink()
+                removed_count += 1
+                logging.debug(f"Removed old checkpoint: {checkpoint}")
+            except Exception as e:
+                logging.warning(f"Failed to remove checkpoint {checkpoint}: {e}")
+        
+        if removed_count > 0:
+            logging.info(f"Cleaned up {removed_count} old checkpoints")
+    
+    def get_checkpoint_stats(self) -> Dict[str, Any]:
+        """Get statistics about checkpoints."""
+        checkpoints = list(self.checkpoint_dir.glob("checkpoint_step_*.pth"))
+        
+        total_size = sum(p.stat().st_size for p in checkpoints)
+        
+        stats = {
+            'count': len(checkpoints),
+            'max_checkpoints': self.max_checkpoints,
+            'total_size_mb': total_size / (1024 * 1024),
+            'latest_step': None,
+            'oldest_step': None
+        }
+        
+        if checkpoints:
+            checkpoints.sort(key=lambda p: p.stat().st_mtime)
+            try:
+                oldest = torch.load(checkpoints[0], map_location='cpu')
+                latest = torch.load(checkpoints[-1], map_location='cpu')
+                stats['oldest_step'] = oldest.get('step')
+                stats['latest_step'] = latest.get('step')
+            except Exception:
+                pass
+        
+        return stats
 
 
 class RNADataset(Dataset):
@@ -157,7 +450,7 @@ class RNADataset(Dataset):
 class RNACollator:
     """Collator for batching RNA data."""
     
-    def __init__(self, max_seq_len: int = 512):
+    def __init__(self, max_seq_len: int = MODEL.DEFAULT_MAX_SEQ_LEN):
         self.max_seq_len = max_seq_len
     
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -199,9 +492,12 @@ class Trainer:
     """Trainer for RNA 3D folding pipeline."""
     
     def __init__(self, 
-                 model: "IntegratedModel",
+                 model: IntegratedModel,
                  config: TrainingConfig,
                  device: torch.device = torch.device("cuda")):
+        # Validate configuration before initialization
+        config.validate()
+        
         self.model = model
         self.config = config
         self.device = device
@@ -226,7 +522,7 @@ class Trainer:
         self.best_loss = float('inf')
         
         # Create directories
-        Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        Path(config.output_dir).mkdir(parents=True, exist_ok=True)
         Path(config.log_dir).mkdir(parents=True, exist_ok=True)
     
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
@@ -441,29 +737,57 @@ class Trainer:
         if not sequences:
             return torch.empty((0, 0), dtype=torch.long, device=self.device)
         
-        # Convert all sequences to strings if they aren't already
+        # Convert all sequences to strings with validation
         string_sequences = []
-        for seq in sequences:
+        for i, seq in enumerate(sequences):
             if isinstance(seq, torch.Tensor):
-                # Convert tensor back to string
-                seq = ''.join([['A', 'U', 'G', 'C', 'N'][token.item()] for token in seq])
-            elif not isinstance(seq, str):
-                seq = str(seq)
-            string_sequences.append(seq)
+                # Convert tensor back to string with validation
+                if seq.numel() == 0:
+                    string_sequences.append("")
+                    continue
+                try:
+                    seq_tokens = seq.cpu().numpy() if seq.device != torch.device('cpu') else seq.numpy()
+                    seq_str = ''.join([self._token_to_char(int(token)) for token in seq_tokens])
+                    string_sequences.append(seq_str)
+                except (ValueError, IndexError) as e:
+                    raise ValueError(f"Invalid tensor sequence at index {i}: {e}")
+            elif isinstance(seq, str):
+                string_sequences.append(seq)
+            else:
+                # Convert other types to string
+                try:
+                    seq_str = str(seq)
+                    string_sequences.append(seq_str)
+                except Exception as e:
+                    raise ValueError(f"Cannot convert sequence at index {i} to string: {e}")
+        
+        # Validate sequences
+        for i, seq in enumerate(string_sequences):
+            if not isinstance(seq, str):
+                raise TypeError(f"Sequence at index {i} is not a string: {type(seq)}")
         
         token_map = {'A': 0, 'U': 1, 'G': 2, 'C': 3, 'N': 4}
         
+        # Find maximum sequence length with reasonable limit
         max_len = max(len(seq) for seq in string_sequences)
+        if max_len > 10000:  # Reasonable upper limit
+            raise ValueError(f"Sequence too long: {max_len} > 10000")
+        
         tokens = torch.zeros(len(string_sequences), max_len, dtype=torch.long, device=self.device)
         
         for i, seq in enumerate(string_sequences):
-            for j, nucleotide in enumerate(seq):
-                if j < max_len and nucleotide in token_map:
-                    tokens[i, j] = token_map[nucleotide]
-                else:
-                    tokens[i, j] = token_map['N']
+            for j, nucleotide in enumerate(seq.upper()):  # Convert to uppercase
+                if j < max_len:
+                    tokens[i, j] = token_map.get(nucleotide, token_map['N'])
         
         return tokens
+    
+    def _token_to_char(self, token: int) -> str:
+        """Convert token integer back to character."""
+        token_map = {0: 'A', 1: 'U', 2: 'G', 3: 'C', 4: 'N'}
+        if token not in token_map:
+            raise ValueError(f"Invalid token: {token}")
+        return token_map[token]
     
     def _compute_local_frames(self, coords: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Compute local coordinate frames from 3D coordinates.
@@ -476,10 +800,18 @@ class Trainer:
             frames: (batch_size, seq_len, 4) quaternion frames
         """
         batch_size, seq_len, _ = coords.shape
+        
+        # Handle edge cases
+        if seq_len < 3:
+            # For very short sequences, return identity frames
+            frames = torch.zeros(batch_size, seq_len, 4, device=coords.device)
+            frames[..., 0] = 1.0  # Default to identity quaternion
+            return frames
+        
         frames = torch.zeros(batch_size, seq_len, 4, device=coords.device)
         frames[..., 0] = 1.0  # Default to identity quaternion
         
-        # Compute local frames for valid residues
+        # Compute local frames for valid residues (skip first and last)
         for i in range(1, seq_len - 1):
             # Check if current, previous, and next residues are valid
             valid_mask = mask[:, i-1] & mask[:, i] & mask[:, i+1]
@@ -592,7 +924,7 @@ def create_training_config(overrides: Optional[Dict] = None) -> TrainingConfig:
     return config
 
 
-def train_model(model: "IntegratedModel",
+def train_model(model: IntegratedModel,
                 train_dataset: RNADataset,
                 val_dataset: Optional[RNADataset] = None,
                 config_overrides: Optional[Dict] = None,
