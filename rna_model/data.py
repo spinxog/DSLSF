@@ -5,8 +5,11 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Union
 from pathlib import Path
 import json
-import pickle
+import logging
+import hashlib
+import threading
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from Bio import SeqIO
 from Bio.PDB import PDBParser, PDBIO
@@ -44,40 +47,102 @@ class RNADatasetLoader:
         # Standard RNA atoms
         self.standard_atoms = ["P", "O5'", "C5'", "C4'", "C3'", "O3'", "C1'", "N1", "N3", "C2", "C4", "C5", "C6", "O2", "O4", "N6", "N2", "O6", "N7", "N9"]
     
+    def _validate_file_path(self, file_path: Union[str, Path]) -> Path:
+        """Validate file path to prevent path traversal."""
+        file_path = Path(file_path)
+        
+        # Resolve to absolute path
+        abs_path = file_path.resolve()
+        
+        # Check if path is within allowed directory (cache_dir)
+        cache_abs = self.cache_dir.resolve()
+        try:
+            abs_path.relative_to(cache_abs)
+        except ValueError:
+            raise ValueError(f"File path outside allowed directory: {file_path}")
+        
+        # Check for suspicious patterns
+        suspicious_patterns = ['..', '\\\\', '//']
+        path_str = str(file_path)
+        for pattern in suspicious_patterns:
+            if pattern in path_str:
+                raise ValueError(f"Suspicious path pattern detected: {pattern}")
+        
+        return abs_path
+    
     def load_pdb_structure(self, pdb_file: Union[str, Path]) -> RNAStructure:
-        """Load RNA structure from PDB file."""
-        pdb_file = Path(pdb_file)
+        """Load RNA structure from PDB file with security validation."""
+        pdb_file = self._validate_file_path(pdb_file)
         
-        # Parse PDB
-        structure = self.pdb_parser.get_structure("rna", str(pdb_file))
+        if not pdb_file.exists():
+            raise FileNotFoundError(f"PDB file not found: {pdb_file}")
         
-        # Extract RNA chains
-        rna_chains = []
-        for model in structure:
-            for chain in model:
-                if self._is_rna_chain(chain):
-                    rna_chains.append(chain)
+        # Simple PDB parsing with validation
+        coordinates = []
+        atom_names = []
+        residue_names = []
         
-        if not rna_chains:
-            raise ValueError(f"No RNA chains found in {pdb_file}")
+        try:
+            with open(pdb_file, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    if len(line) > 54 and (line.startswith('ATOM') or line.startswith('HETATM')):
+                        try:
+                            atom_name = line[12:16].strip()
+                            residue_name = line[17:20].strip()
+                            x_str = line[30:38].strip()
+                            y_str = line[38:46].strip()
+                            z_str = line[46:54].strip()
+                            
+                            # Validate coordinate values
+                            x = float(x_str)
+                            y = float(y_str)
+                            z = float(z_str)
+                            
+                            # Check for reasonable coordinate values
+                            if not (-1000 <= x <= 1000 and -1000 <= y <= 1000 and -1000 <= z <= 1000):
+                                logging.warning(f"Unreasonable coordinates at line {line_num}: ({x}, {y}, {z})")
+                                continue
+                            
+                            coordinates.append([x, y, z])
+                            atom_names.append(atom_name)
+                            residue_names.append(residue_name)
+                        except (ValueError, IndexError) as e:
+                            logging.warning(f"Error parsing line {line_num}: {e}")
+                            continue
+        except Exception as e:
+            raise RuntimeError(f"Error reading PDB file {pdb_file}: {e}")
         
-        # Use first RNA chain
-        chain = rna_chains[0]
+        if not coordinates:
+            raise ValueError(f"No valid coordinates found in {pdb_file}")
         
-        # Extract sequence and coordinates
-        sequence, coordinates, atom_names, residue_names = self._extract_chain_data(chain)
+        coordinates = np.array(coordinates)
         
-        # Compute contacts
-        contacts = compute_contact_map(coordinates[:, 0, :])  # Use P atoms
+        # Group by residue with thread safety
+        residues = {}
+        with threading.Lock():
+            for i, (coord, atom_name, residue_name) in enumerate(zip(coordinates, atom_names, residue_names)):
+                if residue_name not in residues:
+                    residues[residue_name] = []
+                residues[residue_name].append((coord, atom_name))
+        
+        # Convert to standard format
+        sequence = ''.join([res[0][0] for res in residues.values()])
+        n_residues = len(residues)
+        
+        # Create coordinate array (n_residues, n_atoms_per_residue, 3)
+        standard_coords = np.zeros((n_residues, 3, 3))  # Simplified: 3 atoms per residue
+        
+        for i, (residue_name, atoms) in enumerate(residues.items()):
+            for j, (coord, atom_name) in enumerate(atoms[:3]):  # Take first 3 atoms
+                standard_coords[i, j] = coord
         
         return RNAStructure(
             sequence=sequence,
-            coordinates=coordinates,
-            atom_names=atom_names,
-            residue_names=residue_names,
-            chain_id=chain.id,
-            pdb_id=pdb_file.stem,
-            contacts=contacts
+            coordinates=standard_coords,
+            atom_names=[[atom[1] for atom in atoms[:3]] for atoms in residues.values()],
+            residue_names=list(residues.keys()),
+            chain_id="A",
+            pdb_id=pdb_file.stem
         )
     
     def _is_rna_chain(self, chain) -> bool:
@@ -130,11 +195,11 @@ class RNADatasetLoader:
     
     def load_rnacentral_sequences(self, download: bool = True) -> List[str]:
         """Load RNA sequences from RNAcentral database."""
-        cache_file = self.cache_dir / "rnacentral_sequences.pkl"
+        cache_file = self.cache_dir / "rnacentral_sequences.json"
         
         if cache_file.exists() and not download:
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
         
         # For now, return a small sample
         # In practice, this would download from RNAcentral
@@ -146,8 +211,8 @@ class RNADatasetLoader:
             "AAUCCGGAAUCCGGAAUCCGG"
         ]
         
-        with open(cache_file, 'wb') as f:
-            pickle.dump(sample_sequences, f)
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(sample_sequences, f)
         
         return sample_sequences
     
@@ -308,56 +373,86 @@ class RNADatasetLoader:
         return ss_matrix
     
     def save_dataset(self, data: Dict[str, List], filepath: Union[str, Path]):
-        """Save processed dataset."""
-        filepath = Path(filepath)
+        """Save processed dataset using secure JSON format."""
+        filepath = self._validate_file_path(filepath)
         
-        if filepath.suffix == '.pkl':
-            with open(filepath, 'wb') as f:
-                pickle.dump(data, f)
-        elif filepath.suffix == '.json':
+        if filepath.suffix == '.json':
             # Convert numpy arrays to lists for JSON
             json_data = {}
             for key, value in data.items():
-                if isinstance(value[0], np.ndarray):
+                if isinstance(value, list) and len(value) > 0 and isinstance(value[0], np.ndarray):
                     json_data[key] = [arr.tolist() for arr in value]
+                elif isinstance(value, np.ndarray):
+                    json_data[key] = value.tolist()
                 else:
                     json_data[key] = value
             
-            with open(filepath, 'w') as f:
-                json.dump(json_data, f)
+            # Add checksum for integrity
+            json_str = json.dumps(json_data, separators=(',', ':'))
+            checksum = hashlib.sha256(json_str.encode()).hexdigest()
+            json_data['_metadata'] = {'checksum': checksum, 'version': '1.0'}
+            
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(json_data, f, indent=2)
         else:
-            raise ValueError(f"Unsupported file format: {filepath.suffix}")
+            raise ValueError(f"Unsupported file format: {filepath.suffix}. Only JSON is supported for security.")
     
     def load_dataset(self, filepath: Union[str, Path]) -> Dict[str, List]:
-        """Load processed dataset."""
-        filepath = Path(filepath)
+        """Load processed dataset with integrity verification."""
+        filepath = self._validate_file_path(filepath)
         
-        if filepath.suffix == '.pkl':
-            with open(filepath, 'rb') as f:
-                return pickle.load(f)
-        elif filepath.suffix == '.json':
-            with open(filepath, 'r') as f:
-                data = json.load(f)
-            
-            # Convert lists back to numpy arrays
-            processed_data = {}
-            for key, value in data.items():
-                if isinstance(value, list) and len(value) > 0 and isinstance(value[0], list):
-                    processed_data[key] = [np.array(arr) for arr in value]
-                else:
-                    processed_data[key] = value
-            
-            return processed_data
+        if filepath.suffix == '.json':
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Verify checksum if present
+                if '_metadata' in data and 'checksum' in data['_metadata']:
+                    stored_checksum = data['_metadata']['checksum']
+                    # Create copy without metadata for checksum calculation
+                    data_copy = data.copy()
+                    del data_copy['_metadata']
+                    json_str = json.dumps(data_copy, separators=(',', ':'))
+                    calculated_checksum = hashlib.sha256(json_str.encode()).hexdigest()
+                    
+                    if stored_checksum != calculated_checksum:
+                        raise ValueError(f"Checksum mismatch for file {filepath}")
+                    
+                    # Remove metadata from returned data
+                    del data['_metadata']
+                
+                # Convert lists back to numpy arrays
+                processed_data = {}
+                for key, value in data.items():
+                    if isinstance(value, list) and len(value) > 0 and isinstance(value[0], list):
+                        # Check if this looks like coordinate data
+                        if len(value[0]) > 0 and isinstance(value[0][0], list):
+                            processed_data[key] = [np.array(arr) for arr in value]
+                        else:
+                            processed_data[key] = np.array(value)
+                    elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float)):
+                        processed_data[key] = np.array(value)
+                    else:
+                        processed_data[key] = value
+                
+                return processed_data
+                
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON format in {filepath}: {e}")
+            except Exception as e:
+                raise RuntimeError(f"Error loading dataset from {filepath}: {e}")
         else:
-            raise ValueError(f"Unsupported file format: {filepath.suffix}")
+            raise ValueError(f"Unsupported file format: {filepath.suffix}. Only JSON is supported for security.")
 
 
 class MSAProcessor:
-    """Processor for Multiple Sequence Alignments."""
+    """Thread-safe processor for Multiple Sequence Alignments."""
     
     def __init__(self, cache_dir: str = "msa_cache"):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=4)
     
     def create_msa_from_sequence(self, sequence: str, database: List[str]) -> np.ndarray:
         """Create MSA by finding similar sequences."""

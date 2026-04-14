@@ -6,6 +6,9 @@ from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
 import numpy as np
 import time
+import logging
+import gc
+from contextlib import contextmanager
 
 from .language_model import RNALanguageModel, LMConfig
 from .secondary_structure import SecondaryStructurePredictor, SSConfig
@@ -114,10 +117,20 @@ class RNAFoldingPipeline:
             except Exception as e:
                 print(f"Model compilation failed: {e}")
     
+    @contextmanager
+    def _memory_context(self):
+        """Context manager for memory management."""
+        try:
+            yield
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+    
     def predict_single_sequence(self,
                                sequence: str,
                                msa_data: Optional[np.ndarray] = None,
-                               return_all_decoys: bool = False) -> Union[Dict, List[Dict]]:
+                               return_all_decoys: bool = False) -> Dict[str, any]:
         """
         Predict 3D structure for a single RNA sequence.
         
@@ -127,66 +140,78 @@ class RNAFoldingPipeline:
             return_all_decoys: Whether to return all decoys or just top 5
             
         Returns:
-            Dictionary with predictions or list of decoys
+            Dictionary with predictions
         """
         start_time = time.time()
         
         # Validate sequence
+        if not sequence or len(sequence) == 0:
+            raise ValueError("Empty sequence provided")
         if len(sequence) > self.config.max_sequence_length:
             raise ValueError(f"Sequence too long: {len(sequence)} > {self.config.max_sequence_length}")
+        if not all(nucleotide in 'AUGCaugc' for nucleotide in sequence):
+            raise ValueError(f"Invalid nucleotides in sequence: {sequence}")
         
-        # Tokenize sequence
-        tokens = self._tokenize_sequence(sequence)
-        
-        # Get LM embeddings (cached if possible)
-        embeddings = self._get_embeddings(tokens)
-        
-        # Predict secondary structure
-        ss_hypotheses = self._predict_secondary_structure(embeddings)
-        
-        # Prepare MSA features
-        msa_features = self._prepare_msa_features(msa_data) if msa_data is not None else None
-        
-        # Generate diverse decoys
-        decoys = self.sampler.sample_decoys(
-            self.model, embeddings, ss_hypotheses, msa_features, self.device
-        )
-        
-        # Cluster and select top 5
-        selected_decoys = self.sampler.cluster_and_select(decoys, n_selected=5)
-        
-        # Refine structures
-        refined_decoys = []
-        for decoy in selected_decoys:
-            if "coordinates" in decoy:
-                refined = self._refine_structure(decoy)
-                refined_decoys.append(refined)
-            else:
-                refined_decoys.append(decoy)
-        
-        # Rank by confidence
-        ranked_decoys = self._rank_decoys(refined_decoys)
-        
-        # Format output
-        output = self._format_output(ranked_decoys, sequence)
-        
-        # Check timeout
-        elapsed_time = time.time() - start_time
-        if elapsed_time > self.config.inference_timeout:
-            print(f"Warning: Inference took {elapsed_time:.2f}s > {self.config.inference_timeout}s")
-        
-        if return_all_decoys:
-            output["all_decoys"] = decoys
-            output["selected_decoys"] = selected_decoys
-            output["refined_decoys"] = refined_decoys
-            output["elapsed_time"] = elapsed_time
-        
-        return output
+        with self._memory_context():
+            try:
+                # Tokenize sequence
+                tokens = self._tokenize_sequence(sequence)
+                
+                # Get LM embeddings (cached if possible)
+                embeddings = self._get_embeddings(tokens)
+                
+                # Predict secondary structure
+                ss_hypotheses = self._predict_secondary_structure(embeddings)
+                
+                # Prepare MSA features
+                msa_features = self._prepare_msa_features(msa_data) if msa_data is not None else None
+                
+                # Generate diverse decoys
+                decoys = self.sampler.sample_decoys(
+                    self.model, embeddings, ss_hypotheses, msa_features, self.device
+                )
+                
+                # Cluster and select top 5
+                selected_decoys = self.sampler.cluster_and_select(decoys, n_selected=5)
+                
+                # Refine structures
+                refined_decoys = []
+                for decoy in selected_decoys:
+                    if "coordinates" in decoy:
+                        refined = self._refine_structure(decoy)
+                        refined_decoys.append(refined)
+                    else:
+                        refined_decoys.append(decoy)
+                
+                # Rank by confidence
+                ranked_decoys = self._rank_decoys(refined_decoys)
+                
+                # Format output
+                output = self._format_output(ranked_decoys, sequence)
+                
+                # Check timeout
+                elapsed_time = time.time() - start_time
+                if elapsed_time > self.config.inference_timeout:
+                    logging.warning(f"Inference took {elapsed_time:.2f}s > {self.config.inference_timeout}s")
+                
+                if return_all_decoys:
+                    output["all_decoys"] = decoys
+                    output["selected_decoys"] = selected_decoys
+                    output["refined_decoys"] = refined_decoys
+                    output["elapsed_time"] = elapsed_time
+                
+                return output
+                
+            except Exception as e:
+                self._handle_prediction_error(sequence, str(e))
     
     def predict_batch(self,
                      sequences: List[str],
                      msa_data: Optional[List[np.ndarray]] = None) -> List[Dict]:
         """Predict structures for multiple sequences."""
+        if not sequences:
+            return []
+            
         results = []
         
         for i, sequence in enumerate(sequences):
@@ -196,9 +221,13 @@ class RNAFoldingPipeline:
                 result = self.predict_single_sequence(sequence, msa)
                 results.append(result)
             except Exception as e:
-                print(f"Error processing sequence {i}: {e}")
-                # Add placeholder result
-                results.append({"error": str(e), "sequence": sequence})
+                logging.error(f"Error processing sequence {i}: {e}")
+                # Fail fast - no fallback coordinates in ML
+                results.append({
+                    "sequence": sequence,
+                    "error": str(e),
+                    "success": False
+                })
         
         return results
     
@@ -217,9 +246,18 @@ class RNAFoldingPipeline:
     
     def _get_embeddings(self, tokens: torch.Tensor) -> torch.Tensor:
         """Get LM embeddings (cached or computed)."""
-        with torch.no_grad():
-            outputs = self.model.language_model(tokens)
-            return outputs["embeddings"]
+        try:
+            with torch.no_grad():
+                outputs = self.model.language_model(tokens)
+                embeddings = outputs["embeddings"]
+                # Validate tensor shape
+                if embeddings.dim() != 3:
+                    raise ValueError(f"Expected 3D embeddings tensor, got {embeddings.dim()}D")
+                return embeddings
+        except Exception as e:
+            logging.error(f"Error getting embeddings: {e}")
+            # Fail fast - no fallback embeddings in ML
+            raise RuntimeError(f"Failed to generate embeddings: {e}")
     
     def _predict_secondary_structure(self, embeddings: torch.Tensor) -> List[Dict]:
         """Predict secondary structure hypotheses."""
@@ -232,15 +270,26 @@ class RNAFoldingPipeline:
     
     def _prepare_msa_features(self, msa_data: np.ndarray) -> torch.Tensor:
         """Prepare MSA features from raw MSA data."""
-        # Simple MSA encoding (placeholder)
-        # In practice, this would be more sophisticated
-        msa_tensor = torch.from_numpy(msa_data).float().to(self.device)
-        
-        # Add batch dimension
-        if msa_tensor.dim() == 3:
-            msa_tensor = msa_tensor.unsqueeze(0)
-        
-        return msa_tensor
+        try:
+            if msa_data is None:
+                return None
+                
+            # Validate input
+            if not isinstance(msa_data, np.ndarray):
+                raise ValueError("MSA data must be numpy array")
+                
+            msa_tensor = torch.from_numpy(msa_data).float().to(self.device)
+            
+            # Add batch dimension if needed
+            if msa_tensor.dim() == 3:
+                msa_tensor = msa_tensor.unsqueeze(0)
+            elif msa_tensor.dim() != 4:
+                raise ValueError(f"Unexpected MSA tensor shape: {msa_tensor.shape}")
+            
+            return msa_tensor
+        except Exception as e:
+            logging.error(f"Error preparing MSA features: {e}")
+            return None
     
     def _refine_structure(self, decoy: Dict) -> Dict:
         """Refine a single decoy structure."""
@@ -289,27 +338,33 @@ class RNAFoldingPipeline:
         
         return [decoy for decoy, _ in scored_decoys]
     
+    def _handle_prediction_error(self, sequence: str, error_msg: str) -> None:
+        """Handle prediction errors by logging and re-raising."""
+        logging.error(f"Failed to predict structure for sequence {sequence[:20]}...: {error_msg}")
+        # Re-raise the error to fail fast - no fallback coordinates in ML
+        raise RuntimeError(f"Structure prediction failed: {error_msg}")
+    
     def _format_output(self, decoys: List[Dict], sequence: str) -> Dict:
         """Format output for competition submission."""
         # Extract C1' coordinates (or first atom) for each decoy
-        c1_coords = []
+        all_coords = []
         
         for decoy in decoys:
             if "coordinates" in decoy:
                 coords = decoy["coordinates"][0, :, 0, :].cpu().numpy()  # First atom
-                c1_coords.append(coords)
-            else:
-                # Fallback: generate dummy coordinates
-                n_residues = len(sequence)
-                dummy_coords = np.arange(n_residues).reshape(-1, 1) * np.array([3.4, 0, 0])
-                c1_coords.append(dummy_coords)
+                all_coords.append(coords)
+        
+        if not all_coords:
+            raise RuntimeError(f"No valid decoys generated for sequence {sequence[:20]}...")
+        
+        coordinates = torch.cat(all_coords, dim=0).cpu().numpy()
         
         # Ensure we have exactly 5 decoys
-        while len(c1_coords) < 5:
-            c1_coords.append(c1_coords[-1].copy())  # Duplicate last
+        while len(all_coords) < 5:
+            all_coords.append(all_coords[-1].copy())  # Duplicate last
         
         # Format for submission (flatten all coordinates)
-        submission_coords = np.concatenate(c1_coords[:5])  # Shape: (5 * n_residues, 3)
+        submission_coords = np.concatenate(all_coords[:5])  # Shape: (5 * n_residues, 3)
         
         return {
             "sequence": sequence,
@@ -342,22 +397,26 @@ class RNAFoldingPipeline:
     
     def enable_competition_mode(self):
         """Enable optimizations for competition deployment."""
-        # Enable evaluation mode
-        self.model.eval()
-        self.sampler.eval()
-        self.refiner.eval()
-        
-        # Disable gradients
-        for param in self.model.parameters():
-            param.requires_grad = False
-        
-        # Use mixed precision if available
-        if self.config.mixed_precision:
-            self.model = self.model.half()
-            self.sampler = self.sampler.half()
-            self.refiner = self.refiner.half()
-        
-        print("Competition mode enabled")
+        try:
+            # Enable evaluation mode
+            self.model.eval()
+            self.sampler.eval()
+            self.refiner.eval()
+            
+            # Disable gradients
+            for param in self.model.parameters():
+                param.requires_grad = False
+            
+            # Use mixed precision if available
+            if self.config.mixed_precision and torch.cuda.is_available():
+                self.model = self.model.half()
+                self.sampler = self.sampler.half()
+                self.refiner = self.refiner.half()
+            
+            logging.info("Competition mode enabled")
+        except Exception as e:
+            logging.error(f"Error enabling competition mode: {e}")
+            raise
     
     def estimate_inference_time(self, sequence_length: int) -> float:
         """Estimate inference time for a given sequence length."""

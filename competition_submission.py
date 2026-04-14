@@ -23,6 +23,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import pandas as pd
+import gc
+from contextlib import contextmanager
 
 # Add project root to path
 project_root = Path(__file__).parent
@@ -126,7 +128,7 @@ class CompetitionSubmission:
         # Verify cache directory
         if not self.cache_dir.exists():
             self.logger.warning(f"Cache directory {self.cache_dir} not found")
-        
+    
     def load_test_sequences(self, test_file: str) -> Tuple[List[str], List[str]]:
         """Load test sequences from file."""
         self.logger.info(f"Loading test sequences from {test_file}")
@@ -152,10 +154,30 @@ class CompetitionSubmission:
                 
         elif test_path.suffix.lower() in ['.fasta', '.fa', '.fna']:
             # Load from FASTA
-            from Bio import SeqIO
-            for record in SeqIO.parse(test_path, "fasta"):
-                sequences.append(str(record.seq).upper())
-                sequence_ids.append(record.id)
+            try:
+                from Bio import SeqIO
+                for record in SeqIO.parse(test_path, "fasta"):
+                    sequences.append(str(record.seq).upper())
+                    sequence_ids.append(record.id)
+            except ImportError:
+                self.logger.warning("BioPython not installed, falling back to simple FASTA parsing")
+                # Simple FASTA parsing
+                with open(test_path, 'r') as f:
+                    current_seq = ""
+                    current_id = ""
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith('>'):
+                            if current_seq:
+                                sequences.append(current_seq.upper())
+                                sequence_ids.append(current_id or f"seq_{len(sequences)}")
+                            current_id = line[1:]
+                            current_seq = ""
+                        else:
+                            current_seq += line
+                    if current_seq:
+                        sequences.append(current_seq.upper())
+                        sequence_ids.append(current_id or f"seq_{len(sequences)}")
         else:
             # Assume plain text file
             with open(test_path, 'r') as f:
@@ -220,9 +242,25 @@ class CompetitionSubmission:
         
         return np.clip(complexity, 0.0, 1.0)
     
+    @contextmanager
+    def _memory_context(self):
+        """Context manager for memory management during sequence processing."""
+        try:
+            yield
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+    
     def process_sequence(self, sequence: str, sequence_id: str) -> Dict:
-        """Process a single sequence with adaptive budgeting."""
+        """Process a single sequence with adaptive budgeting and memory management."""
         sequence_start_time = time.time()
+        
+        # Validate input
+        if not sequence or len(sequence) == 0:
+            raise ValueError(f"Empty sequence provided for {sequence_id}")
+        if len(sequence) > 512:  # Max sequence length
+            raise ValueError(f"Sequence too long: {len(sequence)} > 512")
         
         # Compute complexity and budget
         complexity = self.compute_complexity_score(sequence)
@@ -230,270 +268,171 @@ class CompetitionSubmission:
         
         self.logger.info(f"Processing {sequence_id} (L={len(sequence)}, complexity={complexity:.2f}, budget={budget:.1f}s)")
         
+        with self._memory_context():
+            try:
+                # Set seed for reproducibility
+                set_seed(hash(sequence) % 2**32)
+                
+                # Predict structure
+                result = self.pipeline.predict_single_sequence(
+                    sequence,
+                    return_all_decoys=False  # Only need top 5 for submission
+                )
+                
+                # Validate result
+                if 'coordinates' not in result:
+                    raise ValueError("No coordinates in pipeline result")
+                
+                # Add metadata
+                result.update({
+                    'sequence_id': sequence_id,
+                    'complexity_score': complexity,
+                    'budget_allocated': budget,
+                    'time_used': time.time() - sequence_start_time,
+                    'success': True
+                })
+                
+                self.logger.info(f"Success {sequence_id}: Generated {result['n_decoys']} decoys in {result['time_used']:.1f}s")
+                
+                return result
+                
+            except Exception as e:
+                # Fail fast - no fallback coordinates in ML
+                self.logger.error(f"Failed {sequence_id}: Error - {e}")
+                
+                return {
+                    'sequence_id': sequence_id,
+                    'sequence': sequence,
+                    'error': str(e),
+                    'success': False,
+                    'complexity_score': complexity,
+                    'budget_allocated': budget,
+                    'time_used': time.time() - sequence_start_time
+                }
+    
+    def create_submission_format(self, predictions: List[Dict]) -> np.ndarray:
+        """Create submission format from predictions."""
+        all_coords = []
+        
+        for pred in predictions:
+            if pred.get('success', False) and 'coordinates' in pred:
+                coords = pred["coordinates"]  # Should be (n_decoys * n_residues, 3)
+                all_coords.append(coords)
+            else:
+                raise ValueError(f"Cannot create submission for failed prediction: {pred.get('sequence_id', 'unknown')}")
+        
+        if not all_coords:
+            raise ValueError("No successful predictions to create submission")
+        
+        return np.concatenate(all_coords, axis=0)
+    
+    def create_summary(self, results: List[Dict]) -> Dict:
+        """Create summary statistics."""
+        successful = [r for r in results if r.get('success', False)]
+        failed = [r for r in results if not r.get('success', False)]
+        
+        summary = {
+            'total_sequences': len(results),
+            'successful': len(successful),
+            'failed': len(failed),
+            'success_rate': len(successful) / len(results) if results else 0.0,
+            'total_time': time.time() - self.global_start_time if self.global_start_time else 0.0,
+            'avg_time_per_sequence': np.mean([r['time_used'] for r in results]) if results else 0.0,
+            'failed_sequences': [r['sequence_id'] for r in failed]
+        }
+        
+        return summary
+    
+    def run_competition(self, test_file: str, output_file: str):
+        """Run complete competition workflow with robust error handling."""
         try:
-            # Set seed for reproducibility
-            set_seed(hash(sequence) % 2**32)
+            self.global_start_time = time.time()
             
-            # Predict structure
-            result = self.pipeline.predict_single_sequence(
-                sequence,
-                return_all_decoys=False  # Only need top 5 for submission
-            )
+            # Load test sequences
+            sequences, sequence_ids = self.load_test_sequences(test_file)
             
-            # Add metadata
-            result.update({
-                'sequence_id': sequence_id,
-                'complexity_score': complexity,
-                'budget_allocated': budget,
-                'time_used': time.time() - sequence_start_time,
-                'success': True
-            })
+            if not sequences:
+                raise ValueError("No sequences loaded from test file")
             
-            self.logger.info(f"✓ {sequence_id}: Generated {result['n_decoys']} decoys in {result['time_used']:.1f}s")
+            # Process all sequences
+            results = []
+            failed_sequences = []
             
-            return result
+            for i, (sequence, seq_id) in enumerate(zip(sequences, sequence_ids)):
+                try:
+                    result = self.process_sequence(sequence, seq_id)
+                    results.append(result)
+                    
+                    if not result.get('success', False):
+                        failed_sequences.append(seq_id)
+                    
+                except Exception as e:
+                    self.logger.error(f"Critical error processing {seq_id}: {e}")
+                    failed_sequences.append(seq_id)
+                    continue
+                
+                # Update global time tracking
+                self.global_time_used = time.time() - self.global_start_time
+                self.processed_sequences = i + 1
+                
+                # Check if we're approaching time limit
+                if self.global_time_used > self.time_limit_seconds * 0.9:
+                    self.logger.warning(f"Approaching time limit: {self.global_time_used/3600:.1f}h / {self.time_limit_seconds/3600:.1f}h")
+                    break
+                
+                # Log progress
+                if (i + 1) % 10 == 0:
+                    avg_time = self.global_time_used / (i + 1)
+                    estimated_total = avg_time * len(sequences)
+                    self.logger.info(f"Progress: {i+1}/{len(sequences)}, Avg time: {avg_time:.1f}s, Est total: {estimated_total/3600:.1f}h")
+            
+            if not results:
+                raise RuntimeError("No sequences processed successfully")
+            
+            # Create submission
+            submission_coords = self.create_submission_format(results)
+            
+            # Validate submission format
+            if submission_coords.size == 0:
+                raise ValueError("Empty submission coordinates")
+            
+            # Save submission
+            np.save(output_file, submission_coords)
+            
+            # Create summary
+            summary = self.create_summary(results)
+            summary['failed_sequences'] = failed_sequences
+            
+            with open(output_file.replace('.npy', '_summary.json'), 'w') as f:
+                json.dump(summary, f, indent=2)
+            
+            total_time = time.time() - self.global_start_time
+            self.logger.info(f"Competition completed in {total_time/3600:.2f} hours")
+            self.logger.info(f"Submission saved to {output_file}")
+            self.logger.info(f"Success rate: {summary['success_rate']:.2%} ({summary['successful']}/{summary['total_sequences']})")
+            
+            if failed_sequences:
+                self.logger.warning(f"Failed sequences: {failed_sequences}")
             
         except Exception as e:
-            # Fallback handling
-            self.logger.error(f"✗ {sequence_id}: Error - {e}")
-            
-            # Generate fallback coordinates (simple linear chain)
-            n_residues = len(sequence)
-            fallback_coords = self.generate_fallback_coordinates(n_residues)
-            
-            return {
-                'sequence_id': sequence_id,
-                'sequence': sequence,
-                'coordinates': fallback_coords,
-                'n_decoys': 5,
-                'n_residues': n_residues,
-                'complexity_score': complexity,
-                'budget_allocated': budget,
-                'time_used': time.time() - sequence_start_time,
-                'success': False,
-                'error': str(e)
-            }
-    
-    def generate_fallback_coordinates(self, n_residues: int) -> np.ndarray:
-        """Generate fallback coordinates (simple linear chain)."""
-        # Generate 5 decoys with slight variations
-        decoys = []
-        
-        for decoy_idx in range(5):
-            coords = np.zeros((n_residues, 3))
-            
-            for i in range(n_residues):
-                # Linear arrangement with small variations per decoy
-                coords[i, 0] = i * 3.4  # 3.4Å spacing along x-axis
-                coords[i, 1] = np.sin(i * 0.1 + decoy_idx * 0.2) * 0.5  # Small y variation
-                coords[i, 2] = np.cos(i * 0.1 + decoy_idx * 0.2) * 0.5  # Small z variation
-            
-            decoys.append(coords)
-        
-        # Stack all decoys: (5 * n_residues, 3)
-        return np.stack(decoys).reshape(-1, 3)
-    
-    def check_global_time_budget(self) -> bool:
-        """Check if we're approaching global time limit."""
-        elapsed = time.time() - self.global_start_time
-        remaining_time = self.time_limit_seconds - elapsed
-        
-        # If less than 5% time remaining, enter conservative mode
-        if remaining_time < self.time_limit_seconds * 0.05:
-            self.logger.warning(f"⚠️  Time budget critical: {remaining_time:.1f}s remaining")
-            return True
-        
-        return False
-    
-    def run_competition(self, test_file: str):
-        """Run the complete competition workflow."""
-        self.global_start_time = time.time()
-        self.logger.info(f"Starting competition run with {self.time_limit_seconds/3600:.1f}h time limit")
-        
-        # Setup pipeline
-        self.setup_pipeline()
-        
-        # Load test sequences
-        sequences, sequence_ids = self.load_test_sequences(test_file)
-        
-        # Initialize results storage
-        all_results = []
-        submission_data = []
-        
-        # Process each sequence
-        for i, (sequence, seq_id) in enumerate(zip(sequences, sequence_ids)):
-            self.processed_sequences = i
-            
-            # Check global time budget
-            if self.check_global_time_budget():
-                self.logger.warning("⚠️  Entering conservative mode for remaining sequences")
-                # Could implement simplified processing here
-            
-            # Process sequence
-            result = self.process_sequence(sequence, seq_id)
-            all_results.append(result)
-            
-            # Update global time tracking
-            self.global_time_used = time.time() - self.global_start_time
-            
-            # Add to submission data if successful
-            if result['success']:
-                coords = result['coordinates']
-                for residue_idx in range(result['n_residues']):
-                    for decoy_idx in range(5):
-                        global_residue_idx = i * 5 * result['n_residues'] + decoy_idx * result['n_residues'] + residue_idx
-                        x, y, z = coords[decoy_idx * result['n_residues'] + residue_idx]
-                        submission_data.append({
-                            'residue_id': f"{seq_id}_{residue_idx}_{decoy_idx + 1}",
-                            'x': x,
-                            'y': y,
-                            'z': z,
-                            'sequence_id': seq_id,
-                            'decoy': decoy_idx + 1,
-                            'residue_index': residue_idx
-                        })
-        
-        # Save submission
-        self.save_submission(submission_data)
-        
-        # Save detailed results
-        self.save_detailed_results(all_results)
-        
-        # Generate final report
-        self.generate_final_report(all_results)
-        
-        total_time = time.time() - self.global_start_time
-        self.logger.info(f"✅ Competition completed in {total_time/3600:.2f}h")
-    
-    def save_submission(self, submission_data: List[Dict]):
-        """Save submission file in competition format."""
-        submission_file = self.output_dir / "submission.csv"
-        
-        # Create DataFrame
-        df = pd.DataFrame(submission_data)
-        
-        # Save to CSV
-        df.to_csv(submission_file, index=False)
-        
-        self.logger.info(f"📄 Submission saved to {submission_file}")
-        self.logger.info(f"   Total coordinates: {len(df)}")
-    
-    def save_detailed_results(self, results: List[Dict]):
-        """Save detailed results with metadata."""
-        results_file = self.output_dir / "detailed_results.json"
-        
-        # Convert numpy arrays to lists for JSON serialization
-        json_results = []
-        for result in results:
-            json_result = result.copy()
-            if 'coordinates' in json_result:
-                json_result['coordinates'] = json_result['coordinates'].tolist()
-            json_results.append(json_result)
-        
-        with open(results_file, 'w') as f:
-            json.dump(json_results, f, indent=2)
-        
-        self.logger.info(f"📊 Detailed results saved to {results_file}")
-    
-    def generate_final_report(self, results: List[Dict]):
-        """Generate final competition report."""
-        report_file = self.output_dir / "competition_report.md"
-        
-        # Compute statistics
-        successful = sum(1 for r in results if r['success'])
-        failed = len(results) - successful
-        
-        if successful > 0:
-            avg_time = np.mean([r['time_used'] for r in results if r['success']])
-            avg_complexity = np.mean([r['complexity_score'] for r in results if r['success']])
-            avg_budget = np.mean([r['budget_allocated'] for r in results if r['success']])
-        else:
-            avg_time = avg_complexity = avg_budget = 0
-        
-        total_time = time.time() - self.global_start_time
-        
-        # Generate report
-        report = f"""# RNA 3D Folding Competition Report
-
-## Summary
-- **Total Sequences**: {len(results)}
-- **Successful Predictions**: {successful}
-- **Failed Predictions**: {failed}
-- **Success Rate**: {successful/len(results)*100:.1f}%
-
-## Timing
-- **Total Time**: {total_time/3600:.2f} hours
-- **Average Time per Sequence**: {avg_time:.1f}s
-- **Average Budget Allocated**: {avg_budget:.1f}s
-- **Time Utilization**: {total_time/self.time_limit_seconds*100:.1f}%
-
-## Sequence Analysis
-- **Average Complexity Score**: {avg_complexity:.3f}
-- **Average Sequence Length**: {np.mean([len(r['sequence']) for r in results if 'sequence' in r]):.1f} nt
-
-## Performance by Complexity
-"""
-        
-        # Add complexity breakdown
-        complexity_bins = [(0, 0.3), (0.3, 0.6), (0.6, 1.0)]
-        for low, high in complexity_bins:
-            bin_results = [r for r in results if low <= r['complexity_score'] < high]
-            if bin_results:
-                bin_success = sum(1 for r in bin_results if r['success'])
-                bin_avg_time = np.mean([r['time_used'] for r in bin_results if r['success']])
-                report += f"- **Complexity {low}-{high}**: {len(bin_results)} sequences, {bin_success/len(bin_results)*100:.1f}% success, {bin_avg_time:.1f}s avg\n"
-        
-        report += f"""
-## Memory Usage
-{memory_usage()}
-
-## Recommendations
-- Review failed sequences for common patterns
-- Consider adjusting complexity thresholds if time budget exceeded
-- Monitor GPU memory usage for optimization opportunities
-
-Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}
-"""
-        
-        with open(report_file, 'w') as f:
-            f.write(report)
-        
-        self.logger.info(f"📋 Competition report saved to {report_file}")
+            self.logger.error(f"Competition failed: {e}")
+            raise
 
 
 def main():
-    """Main competition submission function."""
+    """Main entry point."""
     parser = argparse.ArgumentParser(description="RNA 3D Folding Competition Submission")
-    parser.add_argument("--model-path", required=True, 
-                       help="Path to trained model directory")
-    parser.add_argument("--cache-dir", required=True,
-                       help="Directory with cached embeddings and artifacts")
-    parser.add_argument("--test-file", required=True,
-                       help="File containing test sequences (CSV, FASTA, or TXT)")
-    parser.add_argument("--output-dir", required=True,
-                       help="Output directory for submission files")
-    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
-                       help="Device to use for inference")
-    parser.add_argument("--time-limit", type=float, default=8.0,
-                       help="Time limit in hours (default: 8.0)")
-    parser.add_argument("--seed", type=int, default=42,
-                       help="Random seed for reproducibility")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to trained model")
+    parser.add_argument("--cache_dir", type=str, required=True, help="Cache directory")
+    parser.add_argument("--test_file", type=str, required=True, help="Test sequences file")
+    parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to use")
+    parser.add_argument("--time_limit", type=float, default=8.0, help="Time limit in hours")
     
     args = parser.parse_args()
     
-    # Set global seed
-    set_seed(args.seed)
-    
-    # Validate inputs
-    if not Path(args.model_path).exists():
-        print(f"Error: Model path does not exist: {args.model_path}")
-        sys.exit(1)
-    
-    if not Path(args.cache_dir).exists():
-        print(f"Warning: Cache directory does not exist: {args.cache_dir}")
-    
-    # Create competition submission handler
-    submission = CompetitionSubmission(
+    # Initialize competition submission
+    competition = CompetitionSubmission(
         model_path=args.model_path,
         cache_dir=args.cache_dir,
         output_dir=args.output_dir,
@@ -501,16 +440,12 @@ def main():
         time_limit_hours=args.time_limit
     )
     
+    # Setup pipeline
+    competition.setup_pipeline()
+    
     # Run competition
-    try:
-        submission.run_competition(args.test_file)
-        print("✅ Competition submission completed successfully!")
-    except KeyboardInterrupt:
-        print("\n⚠️  Competition interrupted by user")
-        sys.exit(1)
-    except Exception as e:
-        print(f"❌ Competition failed: {e}")
-        sys.exit(1)
+    output_file = Path(args.output_dir) / "submission_coordinates.npy"
+    competition.run_competition(args.test_file, str(output_file))
 
 
 if __name__ == "__main__":

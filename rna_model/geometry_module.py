@@ -44,32 +44,91 @@ class RigidTransform:
     
     @staticmethod
     def matrix_to_quaternion(matrices: torch.Tensor) -> torch.Tensor:
-        """Convert rotation matrices to quaternions."""
+        """Convert rotation matrices to quaternions with numerical stability."""
+        # Validate input shape
+        if matrices.dim() < 2 or matrices.shape[-2:] != (3, 3):
+            raise ValueError(f"Expected matrices with shape (..., 3, 3), got {matrices.shape}")
+        
         trace = matrices[..., 0, 0] + matrices[..., 1, 1] + matrices[..., 2, 2]
         
-        # Handle numerical issues
+        # Handle numerical issues with robust quaternion extraction
         trace = torch.clamp(trace, min=-1.0, max=3.0)
         
-        q_w = 0.5 * torch.sqrt(1 + trace)
-        q_x = (matrices[..., 2, 1] - matrices[..., 1, 2]) / (4 * q_w + 1e-8)
-        q_y = (matrices[..., 0, 2] - matrices[..., 2, 0]) / (4 * q_w + 1e-8)
-        q_z = (matrices[..., 1, 0] - matrices[..., 0, 1]) / (4 * q_w + 1e-8)
+        # Use different cases based on trace value for numerical stability
+        q_w = torch.full_like(trace, 0.0)
+        q_x = torch.full_like(trace, 0.0)
+        q_y = torch.full_like(trace, 0.0)
+        q_z = torch.full_like(trace, 0.0)
         
-        return torch.stack([q_w, q_x, q_y, q_z], dim=-1)
+        # Case 1: trace > 0 (standard case)
+        mask1 = trace > 0
+        if mask1.any():
+            s = 0.5 / torch.sqrt(trace[mask1] + 1.0)
+            q_w[mask1] = 0.25 / s
+            q_x[mask1] = (matrices[mask1, 2, 1] - matrices[mask1, 1, 2]) * s
+            q_y[mask1] = (matrices[mask1, 0, 2] - matrices[mask1, 2, 0]) * s
+            q_z[mask1] = (matrices[mask1, 1, 0] - matrices[mask1, 0, 1]) * s
+        
+        # Case 2: diagonal element 0 is largest
+        mask2 = (trace <= 0) & (matrices[..., 0, 0] > matrices[..., 1, 1]) & (matrices[..., 0, 0] > matrices[..., 2, 2])
+        if mask2.any():
+            s = 2.0 * torch.sqrt(1.0 + matrices[mask2, 0, 0] - matrices[mask2, 1, 1] - matrices[mask2, 2, 2])
+            q_w[mask2] = (matrices[mask2, 2, 1] - matrices[mask2, 1, 2]) / s
+            q_x[mask2] = 0.25 * s
+            q_y[mask2] = (matrices[mask2, 0, 1] + matrices[mask2, 1, 0]) / s
+            q_z[mask2] = (matrices[mask2, 0, 2] + matrices[mask2, 2, 0]) / s
+        
+        # Case 3: diagonal element 1 is largest
+        mask3 = (trace <= 0) & (matrices[..., 1, 1] > matrices[..., 2, 2]) & ~mask2
+        if mask3.any():
+            s = 2.0 * torch.sqrt(1.0 + matrices[mask3, 1, 1] - matrices[mask3, 0, 0] - matrices[mask3, 2, 2])
+            q_w[mask3] = (matrices[mask3, 0, 2] - matrices[mask3, 2, 0]) / s
+            q_x[mask3] = (matrices[mask3, 0, 1] + matrices[mask3, 1, 0]) / s
+            q_y[mask3] = 0.25 * s
+            q_z[mask3] = (matrices[mask3, 1, 2] + matrices[mask3, 2, 1]) / s
+        
+        # Case 4: diagonal element 2 is largest
+        mask4 = (trace <= 0) & ~mask2 & ~mask3
+        if mask4.any():
+            s = 2.0 * torch.sqrt(1.0 + matrices[mask4, 2, 2] - matrices[mask4, 0, 0] - matrices[mask4, 1, 1])
+            q_w[mask4] = (matrices[mask4, 1, 0] - matrices[mask4, 0, 1]) / s
+            q_x[mask4] = (matrices[mask4, 0, 2] + matrices[mask4, 2, 0]) / s
+            q_y[mask4] = (matrices[mask4, 1, 2] + matrices[mask4, 2, 1]) / s
+            q_z[mask4] = 0.25 * s
+        
+        # Normalize quaternions
+        quaternions = torch.stack([q_w, q_x, q_y, q_z], dim=-1)
+        norm = torch.norm(quaternions, dim=-1, keepdim=True)
+        norm = torch.clamp(norm, min=1e-8)  # Prevent division by zero
+        quaternions = quaternions / norm
+        
+        return quaternions
     
     @staticmethod
     def apply_transform(coords: torch.Tensor, 
                        rotations: torch.Tensor, 
                        translations: torch.Tensor) -> torch.Tensor:
-        """Apply rigid transformation to coordinates."""
-        # coords: (..., N, 3)
-        # rotations: (..., 3, 3) or (..., 4) quaternions
-        # translations: (..., 3)
+        """Apply rigid transformation to coordinates with validation."""
+        # Validate input shapes
+        if coords.dim() < 2 or coords.shape[-1] != 3:
+            raise ValueError(f"Expected coords with shape (..., N, 3), got {coords.shape}")
+        if translations.dim() < 1 or translations.shape[-1] != 3:
+            raise ValueError(f"Expected translations with shape (..., 3), got {translations.shape}")
         
+        # Handle rotations (matrix or quaternion)
         if rotations.shape[-1] == 4:
-            rotations = RigidTransform.quaternion_to_matrix(rotations)
+            # Quaternion case
+            if rotations.dim() < 1:
+                raise ValueError(f"Invalid quaternion shape: {rotations.shape}")
+            rotation_matrices = RigidTransform.quaternion_to_matrix(rotations)
+        elif rotations.shape[-1] == 3 and rotations.shape[-2] == 3:
+            # Matrix case
+            rotation_matrices = rotations
+        else:
+            raise ValueError(f"Expected rotations with shape (..., 3, 3) or (..., 4), got {rotations.shape}")
         
-        transformed = torch.einsum('...ij,...kj->...ki', rotations, coords) + translations
+        # Apply transformation with proper broadcasting
+        transformed = torch.einsum('...ij,...kj->...ki', rotation_matrices, coords) + translations
         return transformed
 
 
@@ -211,7 +270,11 @@ class GeometryBlock(nn.Module):
         return seq_repr, coords, frames
     
     def _quaternion_multiply(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
-        """Multiply two quaternions."""
+        """Multiply two quaternions with numerical stability."""
+        # Validate input shapes
+        if q1.shape[-1] != 4 or q2.shape[-1] != 4:
+            raise ValueError(f"Expected quaternions with shape (..., 4), got {q1.shape} and {q2.shape}")
+        
         w1, x1, y1, z1 = q1.unbind(-1)
         w2, x2, y2, z2 = q2.unbind(-1)
         
@@ -220,7 +283,14 @@ class GeometryBlock(nn.Module):
         y = w1*y2 - x1*z2 + y1*w2 + z1*x2
         z = w1*z2 + x1*y2 - y1*x2 + z1*w2
         
-        return torch.stack([w, x, y, z], dim=-1)
+        result = torch.stack([w, x, y, z], dim=-1)
+        
+        # Normalize to prevent drift
+        norm = torch.norm(result, dim=-1, keepdim=True)
+        norm = torch.clamp(norm, min=1e-8)  # Prevent division by zero
+        result = result / norm
+        
+        return result
 
 
 class GeometryModule(nn.Module):

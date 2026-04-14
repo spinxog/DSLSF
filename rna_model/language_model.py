@@ -3,9 +3,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 import math
+import hashlib
+import logging
+from pathlib import Path
 
 
 @dataclass
@@ -156,6 +159,13 @@ class RNALanguageModel(nn.Module):
         super().__init__()
         self.config = config
         
+        # Cache management
+        self._embedding_cache = {}
+        self._cache_version = "1.0"
+        self._max_cache_size = 1000
+        self._cache_hits = 0
+        self._cache_misses = 0
+        
         # Token embeddings (A, U, G, C, N)
         self.token_embed = nn.Embedding(config.vocab_size, config.d_model)
         self.pos_encoding = PositionalEncoding(config.d_model, config.max_seq_len)
@@ -228,8 +238,20 @@ class RNALanguageModel(nn.Module):
             - logits: LM logits (if training)
             - contacts: Contact predictions (if return_contacts=True)
         """
+        # Validate inputs
+        if input_ids.dim() != 2:
+            raise ValueError(f"Expected 2D input_ids, got {input_ids.dim()}D")
+        
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
+        
+        # Validate sequence length
+        if seq_len > self.config.max_seq_len:
+            raise ValueError(f"Sequence length {seq_len} exceeds maximum {self.config.max_seq_len}")
+        
+        # Validate token values
+        if torch.any(input_ids >= self.config.vocab_size):
+            raise ValueError(f"Token IDs exceed vocabulary size {self.config.vocab_size}")
         
         # Create attention mask if not provided
         if attention_mask is None:
@@ -257,14 +279,68 @@ class RNALanguageModel(nn.Module):
         
         return outputs
     
+    def _get_cache_key(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> str:
+        """Generate cache key for embeddings."""
+        # Convert tensors to strings for hashing
+        ids_str = input_ids.cpu().numpy().tobytes()
+        mask_str = attention_mask.cpu().numpy().tobytes() if attention_mask is not None else b''
+        
+        # Create hash
+        combined = ids_str + mask_str + self._cache_version.encode()
+        return hashlib.sha256(combined).hexdigest()[:16]
+    
+    def _clear_cache_if_needed(self):
+        """Clear cache if it exceeds maximum size."""
+        if len(self._embedding_cache) > self._max_cache_size:
+            # Remove oldest entries (simple FIFO)
+            keys_to_remove = list(self._embedding_cache.keys())[:len(self._embedding_cache) // 2]
+            for key in keys_to_remove:
+                del self._embedding_cache[key]
+            logging.info(f"Cleared {len(keys_to_remove)} old cache entries")
+    
     def get_embeddings(self, 
                       input_ids: torch.Tensor,
-                      attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Get frozen embeddings for downstream tasks."""
+                      attention_mask: Optional[torch.Tensor] = None,
+                      use_cache: bool = True) -> torch.Tensor:
+        """Get frozen embeddings for downstream tasks with caching."""
+        if use_cache:
+            cache_key = self._get_cache_key(input_ids, attention_mask)
+            
+            if cache_key in self._embedding_cache:
+                self._cache_hits += 1
+                return self._embedding_cache[cache_key].to(input_ids.device)
+            else:
+                self._cache_misses += 1
+        
         self.eval()
         with torch.no_grad():
             outputs = self.forward(input_ids, attention_mask, return_contacts=False)
-            return outputs["embeddings"]
+            embeddings = outputs["embeddings"]
+            
+            # Cache result if enabled
+            if use_cache:
+                self._embedding_cache[cache_key] = embeddings.cpu()
+                self._clear_cache_if_needed()
+            
+            return embeddings
+    
+    def clear_cache(self):
+        """Clear all cached embeddings."""
+        cache_size = len(self._embedding_cache)
+        self._embedding_cache.clear()
+        logging.info(f"Cleared {cache_size} cached embeddings")
+    
+    def get_cache_stats(self) -> Dict[str, int]:
+        """Get cache statistics."""
+        total_requests = self._cache_hits + self._cache_misses
+        hit_rate = self._cache_hits / total_requests if total_requests > 0 else 0.0
+        
+        return {
+            'cache_size': len(self._embedding_cache),
+            'cache_hits': self._cache_hits,
+            'cache_misses': self._cache_misses,
+            'hit_rate': hit_rate
+        }
 
 
 def masked_span_loss(logits: torch.Tensor, 
