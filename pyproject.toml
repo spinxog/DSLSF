@@ -9,7 +9,7 @@ name = "rna-3d-folding"
 version = "0.1.0"
 description = "RNA 3D structure prediction pipeline"
 authors = [
-    {name = "RNA Folding Developer", email = "developer@rnafold.org"},
+    {name = "RNA Folding Developer"},
 ]
 license = {text = "MIT"}
 readme = "README.md"
