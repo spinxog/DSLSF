@@ -1,17 +1,10 @@
 # RNA 3D Folding Pipeline
 
-A state-of-the-art end-to-end neural pipeline for RNA 3D structure prediction, inspired by recent advances in protein folding (AlphaFold2, RhoFold+, DRfold) and tailored specifically for RNA molecules.
+A state-of-the-art end-to-end neural pipeline for RNA 3D structure prediction, inspired by recent advances in protein folding and tailored specifically for RNA molecules.
 
 ## Overview
 
-This implementation combines:
-
-- **Massive sequence pretraining** on ~23M RNA sequences with contact-aware objectives
-- **Evolutionary features** (MSA, secondary structure) with graceful degradation
-- **Transformer-based geometry modules** with SE(3)-equivariant operations
-- **Multi-task supervision** (distances, angles, torsions, sugar pucker)
-- **Energy-guided refinement** with learned potentials
-- **Ensemble prediction** for best-of-5 TM-score optimization
+This implementation combines massive sequence pretraining with evolutionary features, transformer-based geometry modules, multi-task supervision, and energy-guided refinement to predict RNA 3D structures from sequence alone.
 
 ## Architecture
 
@@ -29,7 +22,7 @@ This implementation combines:
 
 3. **Structure Encoder** (`structure_encoder.py`)
    - Sparse/axial attention for long sequences
-   - Compact student model (≤150M parameters)
+   - Compact student model (<=150M parameters)
    - Window-based attention for memory efficiency
 
 4. **Geometry Module** (`geometry_module.py`)
@@ -51,7 +44,7 @@ This implementation combines:
 
 ```bash
 # Clone repository
-git clone (https://github.com/spinxog/DSLSF)
+git clone <repository-url>
 cd DSLSF
 
 # Install dependencies
@@ -89,14 +82,14 @@ The pipeline is optimized for the 8-hour notebook constraint:
 - **Precomputed embeddings**: LM embeddings cached to avoid runtime computation
 - **Sparse attention**: Efficient handling of sequences >200nt
 - **Adaptive budgeting**: Per-sequence compute allocation based on complexity
-- **Fast sampling**: 20 decoys → cluster → select 5 diverse representatives
+- **Fast sampling**: 20 decoys -> cluster -> select 5 diverse representatives
 - **Lightweight refinement**: 1-3 internal-coordinate optimization steps
 
 ### Performance Targets
 
 - **Inference time**: <144s per sequence (200 sequences in 8h)
 - **Memory usage**: <8GB GPU peak
-- **Bundle size**: ≤15GB compressed artifacts
+- **Bundle size**: <=15GB compressed artifacts
 - **Accuracy**: Best-of-5 TM-score competitive with state-of-the-art
 
 ## Advanced Features
