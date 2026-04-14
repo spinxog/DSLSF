@@ -1,5 +1,4 @@
-def _compute_fallback_embedding(self, tokens: List[int], seq_length: int) -> np.ndarray:
-        """Compute fallback embedding with sequence-specific features."""
-        # Create embedding based on sequence composition
-        composition = np.zeros(4)
-        for token in tokens:
+if self.model_type == 'real':
+                embedding = self._compute_real_embedding(tokens)
+            else:
+                raise RuntimeError(f"Real embedding model not available for sequence: {seq[:10]}...")
