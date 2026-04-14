@@ -86,6 +86,7 @@ class SparseAttention(nn.Module):
             # Define window around position i
             start = max(0, i - self.window_size // 2)
             end = min(seq_len, i + self.window_size // 2 + 1)
+            window_size = end - start
             
             # Extract window queries, keys, values
             q_i = q[:, i:i+1, :, :].transpose(1, 2)  # (batch, heads, 1, head_dim)
@@ -107,6 +108,14 @@ class SparseAttention(nn.Module):
             
             # Store result
             output[:, i:i+1, :, :] = context.transpose(1, 2)  # (batch, 1, heads, head_dim)
+            
+            # Clean up intermediate tensors to prevent memory buildup
+            del q_i, k_window, v_window, scores, attn_weights, context
+            if torch.cuda.is_available() and i % 10 == 0:
+                torch.cuda.empty_cache()
+        
+        # Clean up projection tensors
+        del q, k, v
         
         # Reshape and project output
         output = output.contiguous().view(batch_size, seq_len, self.d_model)

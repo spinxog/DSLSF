@@ -217,8 +217,10 @@ class CompetitionSubmission:
     
     def compute_complexity_score(self, sequence: str) -> float:
         """Compute complexity score for adaptive budgeting."""
-        # Simple heuristic based on sequence composition and length
+        # Validate sequence length
         length = len(sequence)
+        if length == 0:
+            return 0.0
         
         # Count potential junction-forming patterns
         junction_patterns = ['GAAA', 'CUUG', 'GNRA', 'UNCG']  # Common tetraloops
@@ -230,7 +232,7 @@ class CompetitionSubmission:
         # Predicted secondary structure complexity (simplified)
         # Estimate number of stems and loops
         predicted_stems = min(length // 10, 8)  # Rough estimate
-        predicted_loops = predicted_stems - 1
+        predicted_loops = max(0, predicted_stems - 1)  # Ensure non-negative
         
         # Combine into complexity score
         complexity = (
@@ -279,9 +281,16 @@ class CompetitionSubmission:
                     return_all_decoys=False  # Only need top 5 for submission
                 )
                 
-                # Validate result
-                if 'coordinates' not in result:
-                    raise ValueError("No coordinates in pipeline result")
+                # Validate result contains required fields
+                required_fields = ['coordinates', 'n_decoys', 'n_residues']
+                missing_fields = [field for field in required_fields if field not in result]
+                if missing_fields:
+                    raise ValueError(f"Pipeline result missing required fields: {missing_fields}")
+                
+                # Validate coordinates shape
+                coords = result['coordinates']
+                if not isinstance(coords, np.ndarray) or coords.ndim != 2 or coords.shape[1] != 3:
+                    raise ValueError(f"Invalid coordinates shape: {coords.shape if hasattr(coords, 'shape') else type(coords)}")
                 
                 # Add metadata
                 result.update({

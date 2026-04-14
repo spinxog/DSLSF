@@ -48,11 +48,27 @@ class RNADatasetLoader:
         self.standard_atoms = ["P", "O5'", "C5'", "C4'", "C3'", "O3'", "C1'", "N1", "N3", "C2", "C4", "C5", "C6", "O2", "O4", "N6", "N2", "O6", "N7", "N9"]
     
     def _validate_file_path(self, file_path: Union[str, Path]) -> Path:
-        """Validate file path to prevent path traversal."""
+        """Validate file path to prevent path traversal and symlink attacks."""
         file_path = Path(file_path)
         
-        # Resolve to absolute path
+        # Check for suspicious patterns first
+        suspicious_patterns = ['..', '\\\\', '//']
+        path_str = str(file_path)
+        for pattern in suspicious_patterns:
+            if pattern in path_str:
+                raise ValueError(f"Suspicious path pattern detected: {pattern}")
+        
+        # Resolve to absolute path, following symlinks
         abs_path = file_path.resolve()
+        
+        # Check if the original path is a symlink (potential security risk)
+        if file_path.is_symlink():
+            raise ValueError(f"Symbolic links not allowed for security: {file_path}")
+        
+        # Check if any parent directory is a symlink
+        for parent in file_path.parents:
+            if parent.is_symlink():
+                raise ValueError(f"Symbolic links in parent directories not allowed: {parent}")
         
         # Check if path is within allowed directory (cache_dir)
         cache_abs = self.cache_dir.resolve()
@@ -60,13 +76,6 @@ class RNADatasetLoader:
             abs_path.relative_to(cache_abs)
         except ValueError:
             raise ValueError(f"File path outside allowed directory: {file_path}")
-        
-        # Check for suspicious patterns
-        suspicious_patterns = ['..', '\\\\', '//']
-        path_str = str(file_path)
-        for pattern in suspicious_patterns:
-            if pattern in path_str:
-                raise ValueError(f"Suspicious path pattern detected: {pattern}")
         
         return abs_path
     
