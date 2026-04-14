@@ -275,3 +275,16 @@ class FastRefiner(nn.Module):
             refined[:, :, atom, :] = smoothed
         
         return refined
+    
+    def refine_structure(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Refine a single structure."""
+        if coords.dim() == 3:
+            coords = coords.unsqueeze(0)  # Add batch dimension
+        
+        refined = self.forward(coords)
+        
+        return {
+            "coordinates": refined["coordinates"].squeeze(0),
+            "loss": refined["loss"],
+            "refined": True
+        }

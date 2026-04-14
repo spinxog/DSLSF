@@ -1,24 +1,15 @@
-#!/usr/bin/env python3
-"""
-Command-line interface for structure prediction.
-
-This script provides a command-line interface for predicting RNA 3D structures
-using the RNA 3D folding pipeline.
-"""
+"""Command-line interface for RNA 3D folding pipeline."""
 
 import argparse
 import sys
 import json
 from pathlib import Path
 import numpy as np
+import torch
 
-# Add project root to path
-project_root = Path(__file__).parent.parent.parent.parent
-sys.path.append(str(project_root))
-
-from rna_model import RNAFoldingPipeline, PipelineConfig
-from rna_model.logging_config import setup_logger
-from rna_model.config import get_config
+from ..pipeline import RNAFoldingPipeline, PipelineConfig
+from ..logging_config import setup_logger
+from ..config import get_config
 
 
 def predict_command():
@@ -91,7 +82,7 @@ def predict_command():
         "--format",
         type=str,
         default="npy",
-        choices=["npy", "json", "pdb"],
+        choices=["npy", "json"],
         help="Output format"
     )
     
@@ -219,29 +210,6 @@ def predict_command():
         output_file = args.output / "predictions.json"
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)
-        
-        if not args.quiet:
-            logger.info(f"Saved predictions to {output_file}")
-    
-    elif args.format == "pdb":
-        # Save as PDB (simplified)
-        output_file = args.output / "predictions.pdb"
-        with open(output_file, 'w') as f:
-            for i, result in enumerate(results):
-                if result.get("success", True) and "coordinates" in result:
-                    coords = result["coordinates"]
-                    sequence = result["sequence"]
-                    
-                    # Simple PDB format
-                    for decoy_idx in range(min(5, result['n_decoys'])):
-                        start_idx = decoy_idx * result['n_residues']
-                        end_idx = start_idx + result['n_residues']
-                        
-                        for res_idx, (start, end) in enumerate(zip(range(start_idx, end_idx), range(start_idx + 1, end_idx + 1))):
-                            coord = coords[start]
-                            f.write(f"ATOM  CA  {res_idx+1:4d}     {coord[0]:8.3f}  {coord[1]:8.3f}  {coord[2]:8.3f}   1.00  0.00  0.00\n")
-                        
-                        f.write("TER\n")
         
         if not args.quiet:
             logger.info(f"Saved predictions to {output_file}")

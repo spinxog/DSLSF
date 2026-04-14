@@ -27,8 +27,8 @@ setup(
         "Operating System :: OS Independent",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.10",
+        "Programming Language :: python :: 3.9",
+        "Programming Language :: python :: 3.10",
         "Topic :: Scientific/Engineering :: Bio-Informatics",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
     ],
@@ -56,15 +56,7 @@ setup(
             "jupyter>=1.0",
         ],
     },
-    entry_points={
-        "console_scripts": [
-            "rna-predict=rna_model.cli:predict",
-            "rna-train=rna_model.cli:train",
-            "rna-evaluate=rna_model.cli:evaluate",
-            "rna-prepare=rna_model.cli:prepare_data",
-        ],
-    },
-    include_package_data=True,
+        include_package_data=True,
     package_data={
         "rna_model": [
             "data/motif_library/*.json",
