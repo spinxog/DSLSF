@@ -414,8 +414,8 @@ result = pipeline.predict_single_sequence(sequence)
 ```
 
 This structure provides:
-- **Clear separation** of concerns
-- **Scalable organization** for large projects
-- **Standard Python package** structure
-- **Professional development** workflow
-- **Easy navigation** and maintenance
+- Clear separation of concerns
+- Scalable organization for large projects
+- Standard Python package structure
+- Professional development workflow
+- Easy navigation and maintenance
