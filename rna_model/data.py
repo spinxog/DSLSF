@@ -88,6 +88,292 @@ class RNAStructure:
     contacts: Optional[np.ndarray] = None
 
 
+class DataValidator:
+    """Comprehensive data validation for RNA sequences and structures."""
+    
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.config = config or {}
+        self.valid_nucleotides = set('AUGCaugcNn')
+        self.max_sequence_length = self.config.get('max_sequence_length', 2048)
+        self.min_sequence_length = self.config.get('min_sequence_length', 5)
+        self.max_coordinate_value = self.config.get('max_coordinate_value', 1000.0)
+        self.min_coordinate_value = self.config.get('min_coordinate_value', -1000.0)
+        
+    def validate_sequence(self, sequence: str) -> Dict[str, Any]:
+        """Validate RNA sequence."""
+        validation_result = {
+            'valid': True,
+            'errors': [],
+            'warnings': [],
+            'stats': {}
+        }
+        
+        # Check sequence type
+        if not isinstance(sequence, str):
+            validation_result['valid'] = False
+            validation_result['errors'].append("Sequence must be a string")
+            return validation_result
+        
+        # Check sequence length
+        seq_len = len(sequence)
+        validation_result['stats']['length'] = seq_len
+        
+        if seq_len < self.min_sequence_length:
+            validation_result['valid'] = False
+            validation_result['errors'].append(f"Sequence too short: {seq_len} < {self.min_sequence_length}")
+        
+        if seq_len > self.max_sequence_length:
+            validation_result['valid'] = False
+            validation_result['errors'].append(f"Sequence too long: {seq_len} > {self.max_sequence_length}")
+        
+        # Check nucleotide composition
+        invalid_chars = set(sequence.upper()) - self.valid_nucleotides
+        if invalid_chars:
+            validation_result['valid'] = False
+            validation_result['errors'].append(f"Invalid nucleotides: {invalid_chars}")
+        
+        # Calculate composition
+        composition = {}
+        for nuc in self.valid_nucleotides:
+            composition[nuc] = sequence.upper().count(nuc)
+        validation_result['stats']['composition'] = composition
+        
+        # Check for unusual patterns
+        if 'N' in composition and composition['N'] > seq_len * 0.5:
+            validation_result['warnings'].append(f"High proportion of N nucleotides: {composition['N']}/{seq_len}")
+        
+        return validation_result
+    
+    def validate_coordinates(self, coordinates: np.ndarray) -> Dict[str, Any]:
+        """Validate coordinate array."""
+        validation_result = {
+            'valid': True,
+            'errors': [],
+            'warnings': [],
+            'stats': {}
+        }
+        
+        # Check array shape
+        if coordinates.ndim != 3 or coordinates.shape[2] != 3:
+            validation_result['valid'] = False
+            validation_result['errors'].append(f"Invalid coordinate shape: {coordinates.shape}, expected (N, n_atoms, 3)")
+            return validation_result
+        
+        n_residues, n_atoms, _ = coordinates.shape
+        validation_result['stats']['n_residues'] = n_residues
+        validation_result['stats']['n_atoms_per_residue'] = n_atoms
+        
+        # Check for NaN or infinite values
+        if np.any(np.isnan(coordinates)):
+            validation_result['valid'] = False
+            validation_result['errors'].append("Coordinates contain NaN values")
+        
+        if np.any(np.isinf(coordinates)):
+            validation_result['valid'] = False
+            validation_result['errors'].append("Coordinates contain infinite values")
+        
+        # Check coordinate ranges
+        coords_flat = coordinates.flatten()
+        if np.any(coords_flat < self.min_coordinate_value) or np.any(coords_flat > self.max_coordinate_value):
+            validation_result['warnings'].append(
+                f"Coordinates outside reasonable range [{self.min_coordinate_value}, {self.max_coordinate_value}]"
+            )
+        
+        # Calculate statistics
+        validation_result['stats']['min_coord'] = float(np.min(coords_flat))
+        validation_result['stats']['max_coord'] = float(np.max(coords_flat))
+        validation_result['stats']['mean_coord'] = float(np.mean(coords_flat))
+        validation_result['stats']['std_coord'] = float(np.std(coords_flat))
+        
+        return validation_result
+    
+    def validate_structure(self, structure: 'RNAStructure') -> Dict[str, Any]:
+        """Validate complete RNA structure."""
+        validation_result = {
+            'valid': True,
+            'errors': [],
+            'warnings': [],
+            'stats': {}
+        }
+        
+        # Validate sequence
+        seq_validation = self.validate_sequence(structure.sequence)
+        if not seq_validation['valid']:
+            validation_result['valid'] = False
+            validation_result['errors'].extend(seq_validation['errors'])
+        validation_result['warnings'].extend(seq_validation['warnings'])
+        validation_result['stats']['sequence'] = seq_validation['stats']
+        
+        # Validate coordinates
+        coord_validation = self.validate_coordinates(structure.coordinates)
+        if not coord_validation['valid']:
+            validation_result['valid'] = False
+            validation_result['errors'].extend(coord_validation['errors'])
+        validation_result['warnings'].extend(coord_validation['warnings'])
+        validation_result['stats']['coordinates'] = coord_validation['stats']
+        
+        # Check consistency
+        if len(structure.sequence) != len(structure.coordinates):
+            validation_result['valid'] = False
+            validation_result['errors'].append(
+                f"Sequence length ({len(structure.sequence)}) doesn't match coordinate count ({len(structure.coordinates)})"
+            )
+        
+        # Check atom names
+        if len(structure.atom_names) != len(structure.coordinates):
+            validation_result['valid'] = False
+            validation_result['errors'].append(
+                f"Atom names count ({len(structure.atom_names)}) doesn't match coordinate count ({len(structure.coordinates)})"
+            )
+        
+        return validation_result
+
+
+class DataPreprocessor:
+    """Automated data preprocessing pipeline for RNA structures."""
+    
+    def __init__(self, validator: Optional[DataValidator] = None):
+        self.validator = validator or DataValidator()
+        self.preprocessing_stats = {
+            'total_processed': 0,
+            'validation_errors': 0,
+            'validation_warnings': 0,
+            'preprocessing_steps': []
+        }
+    
+    def preprocess_structure(self, structure: 'RNAStructure', 
+                          normalize_coordinates: bool = True,
+                          center_coordinates: bool = True,
+                          remove_invalid_atoms: bool = True) -> Optional['RNAStructure']:
+        """Preprocess a single RNA structure."""
+        self.preprocessing_stats['total_processed'] += 1
+        
+        # Validate structure
+        validation_result = self.validator.validate_structure(structure)
+        
+        if not validation_result['valid']:
+            self.preprocessing_stats['validation_errors'] += 1
+            logging.error(f"Structure validation failed: {validation_result['errors']}")
+            return None
+        
+        if validation_result['warnings']:
+            self.preprocessing_stats['validation_warnings'] += 1
+            for warning in validation_result['warnings']:
+                logging.warning(f"Structure validation warning: {warning}")
+        
+        # Create a copy to avoid modifying original
+        processed_structure = RNAStructure(
+            sequence=structure.sequence,
+            coordinates=structure.coordinates.copy(),
+            atom_names=[atom_names.copy() for atom_names in structure.atom_names],
+            residue_names=structure.residue_names.copy(),
+            metadata=structure.metadata.copy()
+        )
+        
+        # Apply preprocessing steps
+        preprocessing_steps = []
+        
+        # Center coordinates
+        if center_coordinates:
+            processed_structure.coordinates = self._center_coordinates(processed_structure.coordinates)
+            preprocessing_steps.append('centered_coordinates')
+        
+        # Normalize coordinates
+        if normalize_coordinates:
+            processed_structure.coordinates = self._normalize_coordinates(processed_structure.coordinates)
+            preprocessing_steps.append('normalized_coordinates')
+        
+        # Remove invalid atoms
+        if remove_invalid_atoms:
+            processed_structure = self._remove_invalid_atoms(processed_structure)
+            preprocessing_steps.append('removed_invalid_atoms')
+        
+        # Update metadata
+        processed_structure.metadata['preprocessing_steps'] = preprocessing_steps
+        processed_structure.metadata['validation_stats'] = validation_result['stats']
+        
+        self.preprocessing_stats['preprocessing_steps'].extend(preprocessing_steps)
+        
+        return processed_structure
+    
+    def _center_coordinates(self, coordinates: np.ndarray) -> np.ndarray:
+        """Center coordinates at origin."""
+        # Calculate center of mass
+        center = np.mean(coordinates, axis=(0, 1))
+        return coordinates - center
+    
+    def _normalize_coordinates(self, coordinates: np.ndarray) -> np.ndarray:
+        """Normalize coordinates to unit scale."""
+        # Calculate current scale
+        coords_flat = coordinates.flatten()
+        scale = np.std(coords_flat)
+        
+        if scale > 0:
+            return coordinates / scale
+        return coordinates
+    
+    def _remove_invalid_atoms(self, structure: 'RNAStructure') -> 'RNAStructure':
+        """Remove atoms with invalid coordinates."""
+        valid_indices = []
+        valid_atom_names = []
+        valid_residue_names = []
+        
+        for i, (coords, atom_names, residue_name) in enumerate(
+            zip(structure.coordinates, structure.atom_names, structure.residue_names)
+        ):
+            # Check if all atoms in this residue are valid
+            if not np.any(np.isnan(coords)) and not np.any(np.isinf(coords)):
+                valid_indices.append(i)
+                valid_atom_names.append(atom_names)
+                valid_residue_names.append(residue_name)
+        
+        if valid_indices:
+            return RNAStructure(
+                sequence=''.join([structure.residue_names[i] for i in valid_indices]),
+                coordinates=structure.coordinates[valid_indices],
+                atom_names=valid_atom_names,
+                residue_names=valid_residue_names,
+                metadata=structure.metadata
+            )
+        else:
+            # No valid atoms found
+            logging.warning("No valid atoms found in structure")
+            return structure
+    
+    def preprocess_dataset(self, structures: List['RNAStructure'], 
+                          **preprocessing_options) -> Tuple[List['RNAStructure'], Dict[str, Any]]:
+        """Preprocess a dataset of RNA structures."""
+        processed_structures = []
+        processing_stats = {
+            'total_input': len(structures),
+            'successfully_processed': 0,
+            'validation_errors': 0,
+            'validation_warnings': 0,
+            'preprocessing_steps': []
+        }
+        
+        for i, structure in enumerate(structures):
+            try:
+                processed = self.preprocess_structure(structure, **preprocessing_options)
+                if processed is not None:
+                    processed_structures.append(processed)
+                    processing_stats['successfully_processed'] += 1
+                else:
+                    processing_stats['validation_errors'] += 1
+            except Exception as e:
+                processing_stats['validation_errors'] += 1
+                logging.error(f"Error processing structure {i}: {e}")
+        
+        # Update global stats
+        processing_stats['preprocessing_steps'] = self.preprocessing_stats['preprocessing_steps']
+        
+        return processed_structures, processing_stats
+    
+    def get_preprocessing_stats(self) -> Dict[str, Any]:
+        """Get preprocessing statistics."""
+        return self.preprocessing_stats.copy()
+
+
 class RNADatasetLoader:
     """Loader for RNA structure datasets."""
     

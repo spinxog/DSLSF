@@ -2,17 +2,18 @@
 
 import logging
 import sys
-import json
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Dict, Any
 from datetime import datetime
+import json
 
 
 def setup_logging(
     name: str,
     level: str = "INFO",
-    log_file: Optional[Union[str, Path]] = None,
-    structured: bool = False
+    log_file: Optional[Path] = None,
+    structured: bool = False,
+    training: bool = False
 ) -> logging.Logger:
     """Setup logging configuration.
     
@@ -83,6 +84,83 @@ def get_logger(name: str) -> logging.Logger:
         Logger instance
     """
     return setup_logging(name)
+
+
+class TrainingLogger:
+    """Enhanced logger for training operations with detailed metrics."""
+    
+    def __init__(self, name: str, log_file: Optional[Path] = None):
+        self.logger = setup_logging(name, log_file=log_file, training=True)
+        self.training_start_time = datetime.now()
+        self.step_count = 0
+        self.last_log_time = self.training_start_time
+        
+    def log_epoch_start(self, epoch: int, total_epochs: int):
+        """Log epoch start with training progress."""
+        elapsed = datetime.now() - self.training_start_time
+        self.logger.info(f"Epoch {epoch}/{total_epochs} started - Elapsed: {elapsed}")
+    
+    def log_step(self, step: int, loss: float, lr: float, batch_time: float, **metrics):
+        """Log training step with comprehensive metrics."""
+        self.step_count = step
+        current_time = datetime.now()
+        
+        # Create detailed step log
+        log_data = {
+            'step': step,
+            'loss': f"{loss:.6f}",
+            'lr': f"{lr:.2e}",
+            'batch_time': f"{batch_time:.3f}s",
+            'steps_per_sec': f"{1.0/batch_time:.1f}",
+            'elapsed': str(current_time - self.training_start_time)
+        }
+        
+        # Add additional metrics
+        for key, value in metrics.items():
+            if isinstance(value, (int, float)):
+                log_data[key] = f"{value:.6f}" if isinstance(value, float) else str(value)
+        
+        # Log with step context
+        self.logger.info(
+            f"Step {step} - Loss: {loss:.6f} - LR: {lr:.2e} - "
+            f"Batch Time: {batch_time:.3f}s - Steps/sec: {1.0/batch_time:.1f} - "
+            f"Metrics: {json.dumps(metrics, separators=(',', ':'))}"
+        )
+        
+        # Log detailed metrics every 100 steps
+        if step % 100 == 0:
+            self.logger.info(f"Detailed metrics at step {step}: {json.dumps(log_data)}")
+    
+    def log_validation(self, epoch: int, val_loss: float, **metrics):
+        """Log validation results."""
+        metrics_str = " - ".join([f"{k}: {v:.6f}" if isinstance(v, float) else f"{k}: {v}" 
+                                for k, v in metrics.items()])
+        self.logger.info(f"Validation Epoch {epoch} - Loss: {val_loss:.6f} - {metrics_str}")
+    
+    def log_model_save(self, epoch: int, step: int, model_path: str):
+        """Log model checkpoint save."""
+        self.logger.info(f"Model saved at epoch {epoch}, step {step} -> {model_path}")
+    
+    def log_error(self, error: Exception, context: str = ""):
+        """Log error with context."""
+        error_msg = f"Error in {context}: {str(error)}" if context else str(error)
+        self.logger.error(error_msg, exc_info=True)
+    
+    def log_warning(self, message: str, **kwargs):
+        """Log warning with additional context."""
+        context_str = " - ".join([f"{k}: {v}" for k, v in kwargs.items()])
+        full_message = f"{message} - {context_str}" if context_str else message
+        self.logger.warning(full_message)
+    
+    def log_data_info(self, dataset_size: int, batch_size: int, num_batches: int):
+        """Log dataset information."""
+        self.logger.info(f"Dataset info - Size: {dataset_size} - Batch size: {batch_size} - Batches: {num_batches}")
+    
+    def log_performance_stats(self, epoch: int, **stats):
+        """Log performance statistics."""
+        stats_str = " - ".join([f"{k}: {v:.3f}" if isinstance(v, float) else f"{k}: {v}" 
+                              for k, v in stats.items()])
+        self.logger.info(f"Performance stats epoch {epoch} - {stats_str}")
 
 
 class StructuredLogger:
