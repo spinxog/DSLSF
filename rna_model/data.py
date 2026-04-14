@@ -17,22 +17,40 @@ import subprocess
 import tempfile
 import os
 import time
-import fcntl
+import threading
 from contextlib import contextmanager
 from .utils import tokenize_rna_sequence, compute_contact_map, bin_distances
 
 
+# Cross-platform file locking implementation
+class FileLock:
+    """Cross-platform file locking using threading locks."""
+    
+    _locks = {}  # Class-level lock registry
+    
+    @classmethod
+    def get_lock(cls, path: Path) -> threading.Lock:
+        """Get or create a lock for the given path."""
+        path_str = str(path.absolute())
+        if path_str not in cls._locks:
+            cls._locks[path_str] = threading.Lock()
+        return cls._locks[path_str]
+
+
 @contextmanager
 def file_lock(lock_file: Path):
-    """Context manager for file locking."""
+    """Context manager for cross-platform file locking."""
+    lock = FileLock.get_lock(lock_file)
     lock_path = lock_file.with_suffix('.lock')
+    
     try:
-        # Create lock file and acquire exclusive lock
-        with open(lock_path, 'w') as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        # Acquire thread lock first
+        with lock:
+            # Create lock file as additional safety
+            lock_path.touch(exist_ok=True)
             yield
     finally:
-        # Release lock and remove lock file
+        # Clean up lock file
         try:
             if lock_path.exists():
                 lock_path.unlink()

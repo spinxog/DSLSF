@@ -244,38 +244,67 @@ class HPCTrainer:
         latest = max(checkpoints, key=lambda p: p.stat().st_mtime)
         return latest
     
-    def load_checkpoint(self, checkpoint_path: Path):
-        """Load training checkpoint."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+    def load_checkpoint(self, checkpoint_path: Union[str, Path]):
+        """Load training checkpoint with proper distributed synchronization."""
+        checkpoint_path = Path(checkpoint_path)
         
-        # Load model state
-        if 'model_state_dict' in checkpoint:
+        # Synchronize all processes before checkpoint loading
+        if self.is_distributed:
+            dist.barrier()
+        
+        if not checkpoint_path.exists():
+            if self.rank == 0:  # Only log on rank 0 to avoid duplicate messages
+                self.logger.warning(f"Checkpoint not found: {checkpoint_path}")
             if self.is_distributed:
-                self.model.module.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                self.model.load_state_dict(checkpoint['model_state_dict'])
+                dist.barrier()
+            return
         
-        # Load training state
-        if 'global_step' in checkpoint:
-            self.global_step = checkpoint['global_step']
-        if 'epoch' in checkpoint:
-            self.epoch = checkpoint['epoch']
-        if 'best_val_loss' in checkpoint:
-            self.best_val_loss = checkpoint['best_val_loss']
-        
-        # Load optimizer state
-        if self.trainer is not None and hasattr(self.trainer, 'optimizer') and 'optimizer_state_dict' in checkpoint:
-            try:
-                self.trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            except AttributeError as e:
-                self.logger.warning(f"Failed to load optimizer state: {e}")
-        
-        # Load scheduler state
-        if self.trainer is not None and hasattr(self.trainer, 'scheduler') and 'scheduler_state_dict' in checkpoint:
-            try:
-                self.trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            except AttributeError as e:
-                self.logger.warning(f"Failed to load scheduler state: {e}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            
+            # Load model state
+            if 'model_state_dict' in checkpoint:
+                if self.is_distributed:
+                    self.model.module.load_state_dict(checkpoint['model_state_dict'])
+                else:
+                    self.model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Load training state
+            if 'global_step' in checkpoint:
+                self.global_step = checkpoint['global_step']
+            if 'epoch' in checkpoint:
+                self.epoch = checkpoint['epoch']
+            if 'best_val_loss' in checkpoint:
+                self.best_val_loss = checkpoint['best_val_loss']
+            
+            # Load optimizer state
+            if self.trainer is not None and hasattr(self.trainer, 'optimizer') and 'optimizer_state_dict' in checkpoint:
+                try:
+                    self.trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                except AttributeError as e:
+                    if self.rank == 0:
+                        self.logger.warning(f"Failed to load optimizer state: {e}")
+            
+            # Load scheduler state
+            if self.trainer is not None and hasattr(self.trainer, 'scheduler') and 'scheduler_state_dict' in checkpoint:
+                try:
+                    self.trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except AttributeError as e:
+                    if self.rank == 0:
+                        self.logger.warning(f"Failed to load scheduler state: {e}")
+            
+            # Synchronize all processes after checkpoint loading
+            if self.is_distributed:
+                dist.barrier()
+                
+        except Exception as e:
+            if self.rank == 0:
+                self.logger.error(f"Failed to load checkpoint: {e}")
+            raise
+        finally:
+            # Ensure all processes are synchronized
+            if self.is_distributed:
+                dist.barrier()
     
     def save_checkpoint(self, is_best: bool = False):
         """Save training checkpoint with proper distributed synchronization."""
