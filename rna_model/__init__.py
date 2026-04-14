@@ -7,6 +7,8 @@ from .geometry_module import GeometryModule
 from .sampler import RNASampler
 from .refinement import GeometryRefiner
 from .pipeline import RNAFoldingPipeline, PipelineConfig, IntegratedModel
+from .config import GlobalConfig, get_config, validate_config
+from .logging_config import setup_logger, StructuredLogger, PerformanceLogger
 
 __version__ = "0.1.0"
 __all__ = [
@@ -19,4 +21,10 @@ __all__ = [
     "RNAFoldingPipeline",
     "PipelineConfig",
     "IntegratedModel",
+    "GlobalConfig",
+    "get_config",
+    "validate_config",
+    "setup_logger",
+    "StructuredLogger",
+    "PerformanceLogger",
 ]
