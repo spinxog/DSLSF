@@ -2,6 +2,7 @@
 
 import argparse
 import sys
+import os
 import json
 from pathlib import Path
 import numpy as np
@@ -104,6 +105,40 @@ def evaluate_command():
     )
     
     args = parser.parse_args()
+    
+    # Security validation for predictions directory
+    if not args.predictions.exists():
+        parser.error(f"Predictions directory does not exist: {args.predictions}")
+    
+    if not args.predictions.is_dir():
+        parser.error(f"Predictions path is not a directory: {args.predictions}")
+    
+    # Check for suspicious paths
+    predictions_str = str(args.predictions.resolve())
+    suspicious_patterns = ['..', '\\\\', '//', '\0', '|', '<', '>', '"', '*', '?']
+    for pattern in suspicious_patterns:
+        if pattern in predictions_str:
+            parser.error(f"Suspicious path pattern detected in predictions directory: {pattern}")
+    
+    # Check directory permissions
+    if not os.access(args.predictions, os.R_OK):
+        parser.error(f"No read permissions for predictions directory: {args.predictions}")
+    
+    # Validate reference directory if provided
+    if args.reference:
+        if not args.reference.exists():
+            parser.error(f"Reference directory does not exist: {args.reference}")
+        
+        if not args.reference.is_dir():
+            parser.error(f"Reference path is not a directory: {args.reference}")
+        
+        reference_str = str(args.reference.resolve())
+        for pattern in suspicious_patterns:
+            if pattern in reference_str:
+                parser.error(f"Suspicious path pattern detected in reference directory: {pattern}")
+        
+        if not os.access(args.reference, os.R_OK):
+            parser.error(f"No read permissions for reference directory: {args.reference}")
     
     # Setup logging
     if not args.quiet:

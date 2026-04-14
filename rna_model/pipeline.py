@@ -4,6 +4,7 @@
 
 import torch
 import torch.nn as nn
+from pathlib import Path
 
 from .language_model import RNALanguageModel
 from .secondary_structure import SecondaryStructurePredictor
@@ -26,7 +27,7 @@ from .utils import (
 class RNAFoldingPipeline:
     """Main RNA 3D folding pipeline."""
     
-    def __init__(self, config):
+    def __init__(self, config: PipelineConfig) -> None:
         self.config = config
         self.logger = setup_logger("rna_folding")
         
@@ -42,6 +43,25 @@ class RNAFoldingPipeline:
     
     def predict_single_sequence(self, sequence: str, return_all_decoys: bool = False) -> dict:
         """Predict structure for a single RNA sequence."""
+        # Input validation
+        if not sequence or not isinstance(sequence, str):
+            error_msg = "Invalid sequence: sequence must be a non-empty string"
+            self.logger.error(error_msg)
+            return {"sequence": sequence, "error": error_msg, "success": False}
+        
+        if len(sequence) > self.config.max_sequence_length:
+            error_msg = f"Sequence too long: {len(sequence)} > {self.config.max_sequence_length}"
+            self.logger.error(error_msg)
+            return {"sequence": sequence, "error": error_msg, "success": False}
+        
+        # Validate sequence contains only valid nucleotides
+        valid_nucleotides = set('AUGCaugcNn')
+        invalid_chars = set(sequence.upper()) - valid_nucleotides
+        if invalid_chars:
+            error_msg = f"Invalid nucleotides in sequence: {invalid_chars}"
+            self.logger.error(error_msg)
+            return {"sequence": sequence, "error": error_msg, "success": False}
+        
         self.logger.info(f"Predicting structure for sequence: {sequence[:20]}...")
         
         try:
@@ -105,21 +125,59 @@ class RNAFoldingPipeline:
                 "success": False
             }
     
-    def _tokenize_sequence(self, sequence: str) -> dict:
+    def _tokenize_sequence(self, sequence: str) -> Dict[str, int]:
         """Tokenize RNA sequence."""
         token_map = {'A': 0, 'U': 1, 'G': 2, 'C': 3, 'N': 4}
         tokens = [token_map.get(nuc, 4) for nucleotide in sequence.upper()]
         return {"tokens": tokens, "length": len(tokens)}
     
-    def load_model(self, model_path: str):
-        """Load model from checkpoint."""
+    def load_model(self, model_path: str) -> None:
+        """Load model from checkpoint with security validation."""
+        # Input validation
+        if not model_path or not isinstance(model_path, str):
+            raise ValueError("Model path must be a non-empty string")
+        
+        model_path = Path(model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        
+        if not model_path.suffix in ['.pth', '.pt']:
+            raise ValueError(f"Invalid model file extension: {model_path.suffix}")
+        
+        # Security check: ensure file is not suspiciously large
+        file_size = model_path.stat().st_size
+        if file_size > 10 * 1024 * 1024 * 1024:  # 10GB limit
+            raise ValueError(f"Model file too large: {file_size / (1024**3):.1f}GB")
+        
         try:
-            checkpoint = torch.load(model_path, map_location=self.config.device)
-            self.language_model.load_state_dict(checkpoint.get('language_model', {}))
-            self.secondary_structure.load_state_dict(checkpoint.get('secondary_structure', {}))
-            self.structure_encoder.load_state_dict(checkpoint.get('structure_encoder', {}))
-            self.geometry_module.load_state_dict(checkpoint.get('geometry_module', {}))
-            self.logger.info(f"Model loaded from {model_path}")
+            # Load with weights_only=True for security
+            checkpoint = torch.load(model_path, map_location=self.config.device, weights_only=True)
+            
+            # Validate checkpoint structure
+            required_keys = ['language_model', 'secondary_structure', 'structure_encoder', 'geometry_module']
+            missing_keys = [key for key in required_keys if key not in checkpoint]
+            if missing_keys:
+                raise KeyError(f"Missing required keys in checkpoint: {missing_keys}")
+            
+            # Load state dictionaries with validation
+            self.language_model.load_state_dict(checkpoint['language_model'])
+            self.secondary_structure.load_state_dict(checkpoint['secondary_structure'])
+            self.structure_encoder.load_state_dict(checkpoint['structure_encoder'])
+            self.geometry_module.load_state_dict(checkpoint['geometry_module'])
+            
+            # Set models to eval mode for inference
+            self.language_model.eval()
+            self.secondary_structure.eval()
+            self.structure_encoder.eval()
+            self.geometry_module.eval()
+            self.sampler.eval()
+            self.refiner.eval()
+            
+            self.logger.info(f"Model loaded successfully from {model_path}")
+            
+        except torch.serialization.pickle.UnpicklingError as e:
+            self.logger.error(f"Corrupted model file: {e}")
+            raise ValueError(f"Invalid or corrupted model file: {e}")
         except Exception as e:
             self.logger.error(f"Failed to load model: {e}")
             raise
@@ -129,6 +187,19 @@ class PipelineConfig:
     """Configuration for the RNA folding pipeline."""
     
     def __init__(self, device="auto", max_sequence_length=512, mixed_precision=True):
+        # Validate inputs
+        if device not in ["auto", "cpu", "cuda"]:
+            raise ValueError(f"Invalid device: {device}. Must be 'auto', 'cpu', or 'cuda'")
+        
+        if not isinstance(max_sequence_length, int) or max_sequence_length <= 0:
+            raise ValueError(f"max_sequence_length must be a positive integer, got {max_sequence_length}")
+        
+        if max_sequence_length > 10000:
+            raise ValueError(f"max_sequence_length too large: {max_sequence_length}. Maximum allowed is 10000")
+        
+        if not isinstance(mixed_precision, bool):
+            raise ValueError(f"mixed_precision must be boolean, got {type(mixed_precision)}")
+        
         self.device = device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
         self.max_sequence_length = max_sequence_length
         self.mixed_precision = mixed_precision

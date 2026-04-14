@@ -144,6 +144,24 @@ def train_command():
     
     args = parser.parse_args()
     
+    # Security validation for data directory
+    if not args.data_dir.exists():
+        parser.error(f"Data directory does not exist: {args.data_dir}")
+    
+    if not args.data_dir.is_dir():
+        parser.error(f"Data path is not a directory: {args.data_dir}")
+    
+    # Check for suspicious paths
+    data_dir_str = str(args.data_dir.resolve())
+    suspicious_patterns = ['..', '\\\\', '//', '\0', '|', '<', '>', '"', '*', '?']
+    for pattern in suspicious_patterns:
+        if pattern in data_dir_str:
+            parser.error(f"Suspicious path pattern detected in data directory: {pattern}")
+    
+    # Check directory permissions
+    if not os.access(args.data_dir, os.R_OK):
+        parser.error(f"No read permissions for data directory: {args.data_dir}")
+    
     # Setup logging
     if not args.quiet:
         logger = setup_logger("rna_train", args.log_file, args.log_level)
