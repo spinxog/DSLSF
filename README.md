@@ -30,7 +30,7 @@ This pipeline combines state-of-the-art machine learning with physics-based mode
 
 ```bash
 # Clone the repository
-git clone https://github.com/rnafold/rna-3d-folding.git
+git clone https://github.com/spinxog/DSLSF
 cd rna-3d-folding
 
 # Install dependencies
