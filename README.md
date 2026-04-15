@@ -209,7 +209,7 @@ We thank the RNA structure prediction community for valuable datasets and benchm
 
 ## Contact
 
-For questions, issues, or collaborations, please open an issue on GitHub or visit our [discussions page](https://github.com/rnafold/rna-3d-folding/discussions).
+For questions, issues, or collaborations, please open an issue on GitHub or visit our [discussions page](https://github.com/spinxog/DSLSF/projects).
 
 ---
 
