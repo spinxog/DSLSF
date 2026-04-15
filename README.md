@@ -1,10 +1,6 @@
-# RNA 3D Folding Pipeline
-
-A comprehensive toolkit for predicting and analyzing RNA 3D structures using advanced geometric deep learning and sampling techniques.
-
 ## Overview
 
-This pipeline combines state-of-the-art machine learning with physics-based modeling to accurately predict RNA tertiary structures from sequence data. It implements topology-aware sampling methods and SE(3)-equivariant neural networks for robust structural prediction.
+DSLSF - Deep Learning Structure Folding is a deep learning structure folding model for RNA molecules. It combines physics-based modeling to accurately predict RNA tertiary structures from sequence data. It implements topology-aware sampling methods and SE(3)-equivariant neural networks for robust structural prediction.
 
 ## Key Features
 
@@ -150,19 +146,6 @@ tm_score = compute_tm_score(aligned_coords1, aligned_coords2)
 - **NPZ files** for compressed data
 - **JSON reports** for analysis results
 
-## Benchmarks
-
-### RNA-Puzzle Dataset
-Our method achieves competitive performance on standard RNA structure prediction benchmarks:
-
-| Method | TM-score | RMSD (Å) |
-|--------|----------|----------|
-| Our Method | 0.72 | 2.8 |
-| Reference A | 0.68 | 3.2 |
-| Reference B | 0.65 | 3.5 |
-
-## Contributing
-
 We welcome contributions! Please see our [contributing guidelines](CONTRIBUTING.md) for details.
 
 ### Development Setup
@@ -183,11 +166,11 @@ isort rna_model/
 If you use this software in your research, please cite:
 
 ```bibtex
-@software{rna_3d_folding,
-  title={RNA 3D Folding Pipeline},
-  author={RNA Folding Team},
+@software{DSLSF,
+  title={Deep Learning Structure Folding},
+  author={Pradip Debnath},
   year={2024},
-  url={https://github.com/rnafold/rna-3d-folding}
+  url={https://github.com/spinxog/DSLSF}
 }
 ```
 
@@ -209,7 +192,7 @@ We thank the RNA structure prediction community for valuable datasets and benchm
 
 ## Contact
 
-For questions, issues, or collaborations, please open an issue on GitHub or visit our [discussions page](https://github.com/spinxog/DSLSF/projects).
+For questions, issues, or collaborations, please open an issue on GitHub or visit our [discussions page](https://github.com/spinxog/DSLSF/discussions).
 
 ---
 
