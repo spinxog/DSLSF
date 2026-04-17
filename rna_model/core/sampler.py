@@ -238,6 +238,11 @@ class RNASampler(nn.Module):
         noise = torch.randn_like(initial_coords) * 0.1 * temperature
         coords = initial_coords + noise
         
+        # Initialize best_energy and best_coords before the loop
+        best_energy = float('inf')
+        best_coords = coords.clone()
+        patience_counter = 0
+        
         # Apply fragment-based sampling
         for step in range(self.config.n_steps):
             # Progress indicator for long operations
@@ -295,12 +300,6 @@ class RNASampler(nn.Module):
             
             # Calculate current energy (simple approximation)
             current_energy = self._calculate_energy(coords, sequence)
-            
-            # Initialize best_energy and best_coords on first iteration
-            if step == 0:
-                best_energy = current_energy
-                best_coords = coords.clone()
-                patience_counter = 0
             
             # Check for improvement
             if current_energy < best_energy - self.config.convergence_threshold:

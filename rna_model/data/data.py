@@ -653,6 +653,7 @@ class DataPreprocessor:
             coordinates=structure.coordinates.copy(),
             atom_names=[atom_names.copy() for atom_names in structure.atom_names],
             residue_names=structure.residue_names.copy(),
+            chain_id=structure.chain_id,
             metadata=structure.metadata.copy()
         )
         
@@ -715,6 +716,7 @@ class DataPreprocessor:
                 coordinates=structure.coordinates[valid_indices],
                 atom_names=valid_atom_names,
                 residue_names=valid_residue_names,
+                chain_id=structure.chain_id,
                 metadata=structure.metadata
             )
         else:

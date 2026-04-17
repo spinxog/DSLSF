@@ -44,12 +44,14 @@ class PositionalEncoding(nn.Module):
         
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
+        pe = pe.unsqueeze(0)  # Shape: (1, max_seq_len, d_model)
         
         self.register_buffer('pe', pe)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:x.size(0), :]
+        # x shape: (batch_size, seq_len, d_model)
+        # pe shape: (1, max_seq_len, d_model)
+        return x + self.pe[:, :x.size(1), :]
 
 
 class MultiHeadAttention(nn.Module):

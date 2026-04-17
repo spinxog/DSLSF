@@ -168,10 +168,6 @@ def _memory_efficient_contact_map(
         for j in range(i, n_atoms, chunk_size):  # Start from i for symmetry
             end_j = min(j + chunk_size, n_atoms)
             
-            # Skip diagonal chunks
-            if i == j:
-                continue
-            
             # Compute chunk distances efficiently
             chunk_i = coords[i:end_i]
             chunk_j = coords[j:end_j]
@@ -185,7 +181,15 @@ def _memory_efficient_contact_map(
             
             # Store results
             contact_map[i:end_i, j:end_j] = chunk_contacts
-            contact_map[j:end_j, i:end_i] = chunk_contacts.T  # Symmetric
+            
+            # For diagonal chunks (i == j), set diagonal to False (no self-contact)
+            if i == j:
+                chunk_size_actual = end_i - i
+                for k in range(chunk_size_actual):
+                    contact_map[i + k, i + k] = False
+            else:
+                # Symmetric copy for off-diagonal chunks
+                contact_map[j:end_j, i:end_i] = chunk_contacts.T
     
     return contact_map
 
