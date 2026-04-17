@@ -941,7 +941,8 @@ def train_model(model: IntegratedModel,
     config = create_training_config(config_overrides)
     
     # Create data loaders
-    collator = RNACollator(max_seq_len=512)
+    from ..core.constants import MODEL
+    collator = RNACollator(max_seq_len=MODEL.DEFAULT_MAX_SEQ_LEN)
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,

@@ -13,6 +13,7 @@ import time
 from .utils import compute_contact_map
 from .geometry_module import RigidTransform
 from .logging_config import setup_logging
+from .constants import MODEL
 
 
 @dataclass
@@ -144,8 +145,8 @@ class RNASampler(nn.Module):
         if seq_len != len(sequence):
             raise ValueError(f"Embedding sequence length {seq_len} doesn't match sequence length {len(sequence)}")
         
-        if d_model != 512:
-            raise ValueError(f"Expected embedding dimension 512, got {d_model}")
+        if d_model != MODEL.DEFAULT_D_MODEL:
+            raise ValueError(f"Expected embedding dimension {MODEL.DEFAULT_D_MODEL}, got {d_model}")
         
         # Use thread-local random state for reproducibility
         torch_rng = self._torch_rng

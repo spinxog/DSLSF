@@ -132,12 +132,12 @@ class ExperimentManager:
         exp_dir = self.experiments_dir / experiment_id
         
         # Load configuration
-        if exp_dir / "config.json":
+        if (exp_dir / "config.json").exists():
             with open(exp_dir / "config.json", 'r') as f:
                 exp_info['config'] = json.load(f)
         
         # Load results if available
-        if exp_dir / "results.json":
+        if (exp_dir / "results.json").exists():
             with open(exp_dir / "results.json", 'r') as f:
                 exp_info['results'] = json.load(f)
         
