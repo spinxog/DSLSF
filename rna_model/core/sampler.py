@@ -488,8 +488,9 @@ class RNASampler(nn.Module):
         batch_indices = torch.arange(seq_len, device=coords.device)
         contact_map[:, batch_indices, batch_indices] = 0.0
             
-        # Clean up computation tensors
-        del rep_coords, diff, batch_indices
+        # Clean up computation tensors (only if they exist)
+        if 'rep_coords' in dir() and 'diff' in dir():
+            del rep_coords, diff
         # Additional cleanup for large tensors
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

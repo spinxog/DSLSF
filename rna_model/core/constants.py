@@ -5,8 +5,8 @@ used throughout the codebase, making them easily configurable
 and documented.
 """
 
-from dataclasses import dataclass
-from typing import Dict, Any
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Set, FrozenSet
 
 
 @dataclass
@@ -16,10 +16,14 @@ class BiologicalConstants:
     # RNA nucleotides
     VALID_NUCLEOTIDES: str = "AUGCaugcNn"
     VALID_NUCLEOTIDES_UPPER: str = "AUGCN"
-    STANDARD_RNA_RESIDUES: set = frozenset({'A', 'U', 'G', 'C'})
+    STANDARD_RNA_RESIDUES: FrozenSet[str] = frozenset({'A', 'U', 'G', 'C'})
     
     # Standard RNA atoms (simplified representation)
-    STANDARD_ATOMS: list = None  # Will be set in __post_init__
+    STANDARD_ATOMS: List[str] = field(default_factory=lambda: [
+        "P", "O5'", "C5'", "C4'", "C3'", "O3'", "C1'", 
+        "N1", "N3", "C2", "C4", "C5", "C6", "O2", "O4", 
+        "N6", "N2", "O6", "N7", "N9"
+    ])
     N_ATOMS_PER_RESIDUE: int = 3  # P, C4', N1 (simplified)
     
     # Bond lengths (Angstroms)
@@ -35,14 +39,6 @@ class BiologicalConstants:
     # Physical constants
     AVOGADRO_NUMBER: float = 6.02214076e23
     BOLTZMANN_CONSTANT: float = 1.380649e-23
-    
-    def __post_init__(self):
-        if self.STANDARD_ATOMS is None:
-            self.STANDARD_ATOMS = [
-                "P", "O5'", "C5'", "C4'", "C3'", "O3'", "C1'", 
-                "N1", "N3", "C2", "C4", "C5", "C6", "O2", "O4", 
-                "N6", "N2", "O6", "N7", "N9"
-            ]
 
 
 @dataclass

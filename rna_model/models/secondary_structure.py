@@ -361,8 +361,9 @@ def secondary_structure_loss(contact_logits: torch.Tensor,
     
     # Pseudoknot loss
     if target_pseudoknots is not None:
+        pseudoknot_logits = contact_logits  # Reuse for pseudoknot prediction if not separate
         pseudoknot_loss = F.cross_entropy(
-            target_pseudoknots.view(-1, 3),
+            pseudoknot_logits.view(-1, pseudoknot_logits.size(-1)),
             target_pseudoknots.view(-1),
             ignore_index=-100
         )

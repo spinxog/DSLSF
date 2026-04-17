@@ -35,7 +35,7 @@ from ..core.utils import tokenize_rna_sequence, compute_contact_map, bin_distanc
 from ..core.constants import BIOLOGICAL, GEOMETRY, COMPUTATIONAL, VALIDATION
 
 
-def retry_on_io_error(max_retries: int = COMPUTATIONAL.MAX_RETRIES, delay: float = COMPUTATIONAL.IO_DELAY):
+def retry_on_io_error(max_retries: int = COMPUTATIONAL.DEFAULT_MAX_RETRIES, delay: float = COMPUTATIONAL.IO_DELAY):
     """Decorator to retry I/O operations on failure."""
     def decorator(func):
         @wraps(func)

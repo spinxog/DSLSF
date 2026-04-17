@@ -252,7 +252,7 @@ class RNAFoldingPipeline:
                 for batch_idx, (_, sequence) in enumerate(sequences_data):
                     token_dict = self._tokenize_sequence(sequence)
                     tokens = token_dict["tokens"]
-                    batch_tokens[batch_idx, :len(tokens)] = tokens
+                    batch_tokens[batch_idx, :len(tokens)] = torch.tensor(tokens, device=self.device)
                     sequence_lengths.append(len(tokens))
                 
                 # Create attention mask for variable length sequences

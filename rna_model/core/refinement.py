@@ -284,7 +284,7 @@ class FastRefiner(nn.Module):
         refined = self.forward(coords)
         
         return {
-            "coordinates": refined["coordinates"].squeeze(0),
-            "loss": refined["loss"],
+            "coordinates": refined.squeeze(0),
+            "loss": 0.0,
             "refined": True
         }

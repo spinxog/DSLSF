@@ -2,6 +2,7 @@
 
 import torch
 import numpy as np
+import logging
 from typing import Dict, List, Tuple, Optional, Union, Any, Sequence
 import math
 import hashlib
@@ -639,3 +640,153 @@ def set_seed(seed: int = 42) -> None:
     # Make CuDNN deterministic
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def compute_rmsd(coords1: np.ndarray, coords2: np.ndarray) -> float:
+    """Compute RMSD between two coordinate sets using Kabsch algorithm.
+    
+    Args:
+        coords1: First coordinate array (N, 3)
+        coords2: Second coordinate array (N, 3)
+        
+    Returns:
+        RMSD value in Angstroms
+    """
+    if coords1.shape != coords2.shape:
+        raise ValueError(f"Coordinate shapes must match: {coords1.shape} vs {coords2.shape}")
+    
+    # Center the coordinates
+    c1 = coords1 - coords1.mean(axis=0)
+    c2 = coords2 - coords2.mean(axis=0)
+    
+    # Compute optimal rotation using SVD (Kabsch algorithm)
+    h = c1.T @ c2
+    u, s, vt = np.linalg.svd(h)
+    r = vt.T @ u.T
+    
+    # Handle reflection case
+    if np.linalg.det(r) < 0:
+        vt[-1, :] *= -1
+        r = vt.T @ u.T
+    
+    # Rotate coords2
+    c2_rotated = c2 @ r
+    
+    # Compute RMSD
+    rmsd = np.sqrt(np.mean(np.sum((c1 - c2_rotated) ** 2, axis=1)))
+    return float(rmsd)
+
+
+def compute_tm_score(coords1: np.ndarray, coords2: np.ndarray) -> float:
+    """Compute TM-score between two coordinate sets.
+    
+    TM-score is a measure of structural similarity that is length-independent.
+    
+    Args:
+        coords1: First coordinate array (N, 3)
+        coords2: Second coordinate array (N, 3)
+        
+    Returns:
+        TM-score (0 to 1, higher is better)
+    """
+    if coords1.shape != coords2.shape:
+        raise ValueError(f"Coordinate shapes must match: {coords1.shape} vs {coords2.shape}")
+    
+    n_atoms = len(coords1)
+    if n_atoms == 0:
+        return 0.0
+    
+    # Center coordinates
+    c1 = coords1 - coords1.mean(axis=0)
+    c2 = coords2 - coords2.mean(axis=0)
+    
+    # Compute optimal rotation using SVD (Kabsch algorithm)
+    h = c1.T @ c2
+    u, s, vt = np.linalg.svd(h)
+    r = vt.T @ u.T
+    
+    # Handle reflection case
+    if np.linalg.det(r) < 0:
+        vt[-1, :] *= -1
+        r = vt.T @ u.T
+    
+    # Rotate coords2
+    c2_rotated = c2 @ r
+    
+    # Compute distances
+    distances = np.sqrt(np.sum((c1 - c2_rotated) ** 2, axis=1))
+    
+    # TM-score parameters
+    d0 = 1.24 * (n_atoms - 15) ** (1.0/3.0) - 1.8 if n_atoms > 15 else 0.5
+    d0 = max(d0, 0.5)
+    
+    # Compute TM-score
+    tm_score = np.sum(1.0 / (1.0 + (distances / d0) ** 2)) / n_atoms
+    return float(tm_score)
+
+
+def superimpose_coordinates(coords1: np.ndarray, coords2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Superimpose two coordinate sets using Kabsch algorithm.
+    
+    Args:
+        coords1: First coordinate array (N, 3)
+        coords2: Second coordinate array (N, 3)
+        
+    Returns:
+        Tuple of (aligned_coords1, aligned_coords2)
+    """
+    if coords1.shape != coords2.shape:
+        raise ValueError(f"Coordinate shapes must match: {coords1.shape} vs {coords2.shape}")
+    
+    # Center coordinates
+    c1 = coords1 - coords1.mean(axis=0)
+    c2 = coords2 - coords2.mean(axis=0)
+    
+    # Compute optimal rotation using SVD (Kabsch algorithm)
+    h = c1.T @ c2
+    u, s, vt = np.linalg.svd(h)
+    r = vt.T @ u.T
+    
+    # Handle reflection case
+    if np.linalg.det(r) < 0:
+        vt[-1, :] *= -1
+        r = vt.T @ u.T
+    
+    # Rotate and center both
+    aligned_c1 = c1
+    aligned_c2 = c2 @ r
+    
+    return aligned_c1, aligned_c2
+
+
+def bin_distances(distances: np.ndarray, bins: int = 64, max_distance: float = 20.0) -> np.ndarray:
+    """Bin distances into discrete bins.
+    
+    Args:
+        distances: Distance array
+        bins: Number of bins
+        max_distance: Maximum distance value
+        
+    Returns:
+        Binned distance indices
+    """
+    bin_edges = np.linspace(0, max_distance, bins + 1)
+    binned = np.digitize(distances, bin_edges) - 1
+    binned = np.clip(binned, 0, bins - 1)
+    return binned
+
+
+def mask_sequence(tokens: torch.Tensor, mask_prob: float = 0.15) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Create mask for sequence tokens.
+    
+    Args:
+        tokens: Token tensor
+        mask_prob: Probability of masking each token
+        
+    Returns:
+        Tuple of (masked_tokens, mask)
+    """
+    mask = torch.rand(tokens.shape, device=tokens.device) < mask_prob
+    masked_tokens = tokens.clone()
+    masked_tokens[mask] = 4  # Mask token ID (N)
+    return masked_tokens, mask

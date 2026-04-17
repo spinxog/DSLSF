@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 import math
 import logging
@@ -26,7 +26,7 @@ class GeometryConfig:
     distance_bins: int = MODEL.DEFAULT_DISTANCE_BINS
     angle_bins: int = MODEL.DEFAULT_ANGLE_BINS
     torsion_bins: int = MODEL.DEFAULT_TORSION_BINS
-    MAX_ROTATION_MATRIX_VALUE: GEOMETRY.ROTATION_MATRIX_MAX_VALUE
+    max_rotation_matrix_value: float = 10.0
 
 
 class RigidTransform:
@@ -211,8 +211,8 @@ class RigidTransform:
             # Simple check for reasonable value ranges
             # Rotation matrices should have values in [-1, 1] range for valid rotations
             # We use a larger threshold (10.0) to allow for numerical precision
-            if matrices.abs().max() > GeometryConfig.MAX_ROTATION_MATRIX_VALUE:
-                raise ValueError(f"Matrix values outside reasonable range for rotation matrices (>{GeometryConfig.MAX_ROTATION_MATRIX_VALUE})")
+            if matrices.abs().max() > GeometryConfig.max_rotation_matrix_value:
+                raise ValueError(f"Matrix values outside reasonable range for rotation matrices (>{GeometryConfig.max_rotation_matrix_value})")
         
         trace = matrices[..., 0, 0] + matrices[..., 1, 1] + matrices[..., 2, 2]
         

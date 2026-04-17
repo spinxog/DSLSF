@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Union, Optional, Tuple, Dict
+from typing import Union, Optional, Tuple, Dict, Any, List
 from ..core.utils import compute_contact_map, compute_rmsd
 from dataclasses import dataclass
 import math
@@ -205,10 +205,6 @@ class RNALanguageModel(nn.Module):
             elif isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def _get_cache_key(self, input_ids: torch.Tensor) -> str:
-        """Generate cache key for input tensor."""
-        return hashlib.md5(input_ids.cpu().numpy().tobytes()).hexdigest()
-    
     def _get_cached_embeddings(self, cache_key: str) -> Optional[torch.Tensor]:
         """Thread-safe cache retrieval."""
         with self._cache_lock:
@@ -271,8 +267,9 @@ class RNALanguageModel(nn.Module):
             
             for _ in range(n_spans):
                 # Random span length (geometric distribution, mean=3)
-                span_len = torch.geometric(torch.tensor(0.33), sample=True).item() + 1
-                span_len = min(span_len, seq_len // 4)  # Cap at 25% of sequence
+                geom_dist = torch.distributions.Geometric(torch.tensor(0.33))
+                span_len = geom_dist.sample().item() + 1
+                span_len = min(int(span_len), seq_len // 4)  # Cap at 25% of sequence
                 
                 # Random start position
                 start = torch.randint(0, seq_len - span_len + 1, (1,)).item()
