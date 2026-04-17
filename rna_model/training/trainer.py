@@ -898,7 +898,11 @@ class Trainer:
     def load_checkpoint(self, filename: str):
         """Load training checkpoint."""
         filepath = Path(self.config.checkpoint_dir) / filename
-        checkpoint = torch.load(filepath, map_location=self.device)
+        
+        if not filepath.exists():
+            raise FileNotFoundError(f"Checkpoint file not found: {filepath}")
+        
+        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
         
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

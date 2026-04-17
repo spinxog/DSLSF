@@ -188,6 +188,8 @@ class StructureEvaluator:
                     clashes += 1
         
         # Clashscore = clashes / (1000 atoms)
+        if n_atoms == 0:
+            return 0.0
         return (clashes / n_atoms) * 1000
     
     def evaluate_dataset(self,
@@ -201,7 +203,12 @@ class StructureEvaluator:
         all_metrics = []
         
         for i, (pred_decoys, true_structure) in enumerate(zip(predictions, true_structures)):
-            true_coords = true_structure.coordinates[:, 0, :]  # Use P atoms
+            # Handle both 2D (n_atoms, 3) and 3D (n_residues, n_atoms_per_residue, 3) coordinates
+            coords = true_structure.coordinates
+            if coords.ndim == 3:
+                true_coords = coords[:, 0, :]  # Use first atom per residue (e.g., P atoms)
+            else:
+                true_coords = coords  # Already 2D
             decoy_confidences = confidences[i] if confidences else None
             
             metrics = self.evaluate_ensemble(pred_decoys, true_coords, decoy_confidences)

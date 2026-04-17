@@ -101,6 +101,7 @@ class DatasetManager:
                 'coordinates': structure.coordinates.tolist(),
                 'atom_names': structure.atom_names,
                 'residue_names': structure.residue_names,
+                'chain_id': structure.chain_id,
                 'metadata': structure.metadata
             }
             dataset_data['structures'].append(structure_data)
@@ -159,7 +160,8 @@ class DatasetManager:
                 coordinates=np.array(structure_data['coordinates']),
                 atom_names=structure_data['atom_names'],
                 residue_names=structure_data['residue_names'],
-                metadata=structure_data['metadata']
+                chain_id=structure_data.get('chain_id', 'A'),  # Default to 'A' if not present
+                metadata=structure_data.get('metadata', {})
             )
             structures.append(structure)
         
