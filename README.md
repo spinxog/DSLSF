@@ -109,14 +109,7 @@ aligned_coords1, aligned_coords2 = superimpose_coordinates(coords1, coords2)
 tm_score = compute_tm_score(aligned_coords1, aligned_coords2)
 ```
 
-## Performance
-
-### Accuracy Metrics
-- **TM-score**: >0.7 on benchmark RNA structures
-- **RMSD**: <3.0 Å average deviation
-- **Contact prediction**: >85% precision
-
-### Computational Efficiency
+## Computational Efficiency
 - **Vectorized operations** for distance calculations
 - **GPU acceleration** for neural network inference
 - **Parallel processing** for batch predictions
