@@ -14,6 +14,7 @@ DSLSF - Deep Learning Structure Folding is a deep learning structure folding mod
 - **SE(3)-equivariant transformers** for 3D geometric learning
 - **Invariant point attention** for structural features
 - **Multi-scale representations** from local to global structure
+- **MSA integration** for evolutionary sequence information
 - **End-to-end differentiable** pipeline
 
 ### Analysis Tools
@@ -88,6 +89,7 @@ The sampling methodology incorporates techniques from multiple RNA structure pre
 - **Graph-based sampling** inspired by RNA secondary structure graph algorithms
 - **Monte Carlo methods** adapted from protein folding literature
 - **Motif-based approaches** using known RNA structural motifs
+- **Diverse temperature sampling** for ensemble predictions
 
 ## Mathematical Foundation
 
@@ -108,6 +110,18 @@ We implement the Kabsch algorithm for optimal structural superposition:
 aligned_coords1, aligned_coords2 = superimpose_coordinates(coords1, coords2)
 tm_score = compute_tm_score(aligned_coords1, aligned_coords2)
 ```
+
+## Model Configuration
+
+### Architecture
+- **Language Model**: 512d, 12 layers, 8 heads
+- **Geometry Module**: 512d, 8 layers (scaled up for better refinement)
+- **Total Parameters**: ~51M
+
+### Competition Support
+- Kaggle notebook ready for Stanford RNA 3D Folding Challenge
+- 8-hour inference limit compliant
+- Best-of-5 TM-score predictions with diverse sampling
 
 ## Computational Efficiency
 - **Vectorized operations** for distance calculations
@@ -132,6 +146,7 @@ tm_score = compute_tm_score(aligned_coords1, aligned_coords2)
 ### Input Formats
 - **FASTA sequences** for RNA input
 - **PDB files** for reference structures
+- **MSA files** for evolutionary information
 - **JSON configs** for model parameters
 
 ### Output Formats
