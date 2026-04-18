@@ -110,18 +110,26 @@ class TrainingConfig:
                               self.geometry_loss_weight, self.fape_loss_weight]):
             raise ValueError("All loss weights must be non-negative")
         
-        # Validate intervals
-        if self.checkpoint_interval <= 0 or self.checkpoint_interval > self.max_steps:
-            raise ValueError(f"checkpoint_interval must be between 1 and max_steps, got {self.checkpoint_interval}")
+        # Validate intervals - clamp to max_steps if too large
+        if self.checkpoint_interval <= 0:
+            raise ValueError(f"checkpoint_interval must be positive, got {self.checkpoint_interval}")
+        if self.checkpoint_interval > self.max_steps:
+            self.checkpoint_interval = max(1, self.max_steps // 10)  # Auto-adjust
         
-        if self.save_every <= 0 or self.save_every > self.max_steps:
-            raise ValueError(f"save_every must be between 1 and max_steps, got {self.save_every}")
+        if self.save_every <= 0:
+            raise ValueError(f"save_every must be positive, got {self.save_every}")
+        if self.save_every > self.max_steps:
+            self.save_every = max(1, self.max_steps // 10)  # Auto-adjust
         
-        if self.eval_every <= 0 or self.eval_every > self.max_steps:
-            raise ValueError(f"eval_every must be between 1 and max_steps, got {self.eval_every}")
+        if self.eval_every <= 0:
+            raise ValueError(f"eval_every must be positive, got {self.eval_every}")
+        if self.eval_every > self.max_steps:
+            self.eval_every = max(1, self.max_steps // 10)  # Auto-adjust
         
-        if self.log_every <= 0 or self.log_every > self.max_steps:
-            raise ValueError(f"log_every must be between 1 and max_steps, got {self.log_every}")
+        if self.log_every <= 0:
+            raise ValueError(f"log_every must be positive, got {self.log_every}")
+        if self.log_every > self.max_steps:
+            self.log_every = max(1, self.max_steps // 20)  # Auto-adjust
         
         # Validate path
         if not self.output_dir or not isinstance(self.output_dir, str):

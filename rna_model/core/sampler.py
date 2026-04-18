@@ -65,25 +65,9 @@ class RNASampler(nn.Module):
         # Fragment library (simplified)
         self.register_buffer('motif_library', self._create_motif_library())
         
-        # Sampling networks
-        self.coord_generator = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 3 * 3)  # 3 atoms * 3 coordinates
-        )
-        
-        self.confidence_head = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1),
-            nn.Sigmoid()
-        )
+        # Sampling networks - input size will be determined dynamically
+        self.coord_generator = None  # Created on first use based on actual d_model
+        self.confidence_head = None  # Created on first use based on actual d_model
         
     def _create_motif_library(self) -> torch.Tensor:
         """Create a simple motif library."""
@@ -145,8 +129,20 @@ class RNASampler(nn.Module):
         if seq_len != len(sequence):
             raise ValueError(f"Embedding sequence length {seq_len} doesn't match sequence length {len(sequence)}")
         
-        if d_model != MODEL.DEFAULT_D_MODEL:
-            raise ValueError(f"Expected embedding dimension {MODEL.DEFAULT_D_MODEL}, got {d_model}")
+        # Validate d_model is reasonable (should be power of 2 typically, and positive)
+        if d_model <= 0 or d_model > 4096:
+            raise ValueError(f"Invalid embedding dimension: {d_model}, must be between 1 and 4096")
+        
+        # Create networks dynamically if not already created or if d_model changed
+        if self.coord_generator is None or self.coord_generator[0].in_features != d_model:
+            self.coord_generator = nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(d_model // 2, d_model // 4),
+                nn.ReLU(),
+                nn.Linear(d_model // 4, 3 * 3)  # 3 atoms * 3 coordinates
+            ).to(embeddings.device)
         
         # Use thread-local random state for reproducibility
         torch_rng = self._torch_rng
@@ -393,7 +389,8 @@ class RNASampler(nn.Module):
                 self.logger.debug(f"Found {violations.sum().item()} bond violations")
                 self._last_violations = violations.sum().item()  # Track for metrics
                 # Compute directions for violating bonds only
-                bond_directions = bond_vectors / (bond_distances + 1e-8)  # Normalized directions
+                # Need to unsqueeze bond_distances for broadcasting: (batch, seq-1, n_atoms, 1)
+                bond_directions = bond_vectors / (bond_distances.unsqueeze(-1) + 1e-8)  # Normalized directions
                 
                 # Apply corrections only where violations exist
                 for i in range(seq_len - 1):
@@ -401,7 +398,7 @@ class RNASampler(nn.Module):
                         violation_mask = violations[:, i, j]
                         if violation_mask.any():
                             # Apply correction only to violating samples
-                            correction = bond_directions[:, i, j] * (min_dist - bond_distances[:, i, j])
+                            correction = bond_directions[:, i, j] * (min_dist - bond_distances[:, i, j]).unsqueeze(-1)
                             coords[violation_mask, i, j] = coords[violation_mask, i, j] + correction[violation_mask]
                 
                 # Clean up bond constraint tensors
@@ -447,7 +444,9 @@ class RNASampler(nn.Module):
                         j_idx = violation_indices[:, 2]
                         
                         # Apply corrections vectorized
-                        corrections = direction_vectors[batch_idx, i_idx, j_idx] * (min_dist - distances[batch_idx, i_idx, j_idx])
+                        # direction_vectors is (N, 3), distances is (N,), need to unsqueeze for broadcasting
+                        dist_diff = (min_dist - distances[batch_idx, i_idx, j_idx]).unsqueeze(-1)  # (N, 1)
+                        corrections = direction_vectors[batch_idx, i_idx, j_idx] * dist_diff  # (N, 3) * (N, 1) = (N, 3)
                         coords[batch_idx, j_idx, 0] = coords[batch_idx, i_idx, 0] + corrections
                 
                 # Clean up contact constraint tensors

@@ -36,8 +36,8 @@ class IntegratedModel(nn.Module):
         # Secondary structure prediction
         ss_outputs = self.secondary_structure(embeddings)
         
-        # Structure encoding
-        struct_outputs = self.structure_encoder(embeddings, ss_outputs["contacts"])
+        # Structure encoding - use pair_repr from secondary structure outputs
+        struct_outputs = self.structure_encoder(embeddings, ss_outputs["pair_repr"])
         
         # Geometry module
         seq_len = embeddings.size(1)

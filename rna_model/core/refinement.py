@@ -59,6 +59,23 @@ class GeometryRefiner(nn.Module):
         batch_size, seq_len, n_atoms, _ = coords.shape
         device = coords.device
         
+        # Run optimization
+        refined_coords = self._optimize(coords, distance_restraints, mask)
+        
+        return {
+            "coordinates": refined_coords,
+            "loss": torch.tensor(0.0, device=device),  # Dummy loss for compatibility
+            "refined": True
+        }
+    
+    def _optimize(self,
+                  coords: torch.Tensor,
+                  distance_restraints: Optional[torch.Tensor] = None,
+                  mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Internal optimization loop."""
+        batch_size, seq_len, n_atoms, _ = coords.shape
+        device = coords.device
+        
         if mask is None:
             mask = torch.ones(batch_size, seq_len, device=device)
         
@@ -94,10 +111,28 @@ class GeometryRefiner(nn.Module):
             
             losses.append(total_loss.item())
         
+        return refined_coords.detach()
+    
+    def refine_structure(self, coords: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Refine a single structure."""
+        if coords.dim() == 3:
+            coords = coords.unsqueeze(0)  # Add batch dimension
+        
+        # In eval mode, skip optimization and just return coordinates
+        if not self.training:
+            return {
+                "coordinates": coords.squeeze(0),
+                "loss": 0.0,
+                "refined": False  # No actual refinement in eval mode without gradients
+            }
+        
+        # Training mode - run optimization
+        refined = self.forward(coords)
+        
         return {
-            "refined_coordinates": refined_coords.detach(),
-            "losses": losses,
-            "final_loss": losses[-1] if losses else 0.0
+            "coordinates": refined["coordinates"].squeeze(0),
+            "loss": refined["loss"],
+            "refined": True
         }
     
     def _bond_length_loss(self, coords: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:

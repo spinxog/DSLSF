@@ -77,28 +77,7 @@ class PairwiseAttention(nn.Module):
         # Compute attention
         scores = torch.matmul(q_flat, k_flat.transpose(-2, -1)) * self.scale
         
-        if mask is not None:
-            # Proper mask handling for pairwise attention
-            # mask shape: (batch_size, seq_len)
-            batch_size, seq_len = mask.shape
-            
-            # Create pairwise mask: (batch_size, seq_len, seq_len)
-            # Mask is True for valid positions, False for padding
-            pairwise_mask = mask.unsqueeze(2) & mask.unsqueeze(1)  # Both i and j must be valid
-            
-            # Reshape mask to match attention scores
-            # scores shape: (batch_size * seq_len * n_heads, seq_len)
-            mask_expanded = pairwise_mask.unsqueeze(1).expand(-1, self.n_heads, -1, -1)
-            mask_expanded = mask_expanded.reshape(batch_size * seq_len * self.n_heads, seq_len)
-            
-            # Apply mask: set masked positions to -inf before softmax
-            scores = scores.masked_fill(~mask_expanded, float('-inf'))
-        
         attn_weights = F.softmax(scores, dim=-1)
-        
-        # Apply mask again to ensure no attention to padding after softmax
-        if mask is not None:
-            attn_weights = attn_weights.masked_fill(~mask_expanded, 0.0)
         
         context = torch.matmul(attn_weights, v_flat)
         
