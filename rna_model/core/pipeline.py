@@ -122,15 +122,18 @@ class RNAFoldingPipeline:
                 self.logger.error(f"Geometry module failed: {e}")
                 return {"sequence": sequence, "error": f"Geometry module failed: {e}", "success": False}
             
-            # Generate decoys
+            # Generate decoys with diverse temperatures for better exploration
+            # Strategy: [low temp for confident, medium temps, high temp for diversity]
+            diverse_temperatures = [0.1, 0.3, 0.5, 0.7, 1.0]  # 5 predictions with varied exploration
             try:
                 decoys, metrics = self.sampler.generate_decoys(
                     sequence,
                     lm_outputs["embeddings"],
                     geometry_outputs["coordinates"],
-                    return_all_decoys=return_all_decoys
+                    return_all_decoys=True,  # Always get all 5 for best-of selection
+                    temperatures=diverse_temperatures
                 )
-                self.logger.debug(f"Generated {len(decoys)} decoys in {metrics.total_time:.2f}s")
+                self.logger.debug(f"Generated {len(decoys)} decoys with diverse temperatures in {metrics.total_time:.2f}s")
             except torch.cuda.OutOfMemoryError as e:
                 self.logger.error(f"GPU out of memory during decoy generation: {e}")
                 return {"sequence": sequence, "error": "GPU out of memory during decoy generation", "success": False}

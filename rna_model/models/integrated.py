@@ -10,6 +10,7 @@ from .structure_encoder import StructureEncoder
 from ..core.geometry_module import GeometryModule, GeometryConfig
 from ..core.sampler import RNASampler, SamplerConfig
 from ..core.refinement import GeometryRefiner, RefinementConfig
+import torch.nn as nn
 
 
 class IntegratedModel(nn.Module):
@@ -23,6 +24,13 @@ class IntegratedModel(nn.Module):
         self.language_model = RNALanguageModel(config.lm_config)
         self.secondary_structure = SecondaryStructurePredictor(config.ss_config)
         self.structure_encoder = StructureEncoder(config.encoder_config)
+        
+        # Projection layer to bridge encoder output (256d) to geometry module (512d)
+        self.encoder_to_geometry_proj = nn.Linear(
+            config.encoder_config.d_model, 
+            config.geometry_config.d_model
+        )
+        
         self.geometry_module = GeometryModule(config.geometry_config)
         self.sampler = RNASampler(config.sampler_config)
         self.refiner = GeometryRefiner(config.refinement_config)
@@ -39,11 +47,14 @@ class IntegratedModel(nn.Module):
         # Structure encoding - use pair_repr from secondary structure outputs
         struct_outputs = self.structure_encoder(embeddings, ss_outputs["pair_repr"])
         
-        # Geometry module
+        # Project encoder output to geometry module dimensions
         seq_len = embeddings.size(1)
-        pair_repr = struct_outputs["embeddings"].unsqueeze(2).expand(-1, -1, seq_len, -1) + \
-                   struct_outputs["embeddings"].unsqueeze(1).expand(-1, seq_len, -1, -1)
-        geometry_outputs = self.geometry_module(struct_outputs["embeddings"], pair_repr)
+        projected_embeddings = self.encoder_to_geometry_proj(struct_outputs["embeddings"])
+        
+        # Geometry module
+        pair_repr = projected_embeddings.unsqueeze(2).expand(-1, -1, seq_len, -1) + \
+                   projected_embeddings.unsqueeze(1).expand(-1, seq_len, -1, -1)
+        geometry_outputs = self.geometry_module(projected_embeddings, pair_repr)
         
         return {
             "embeddings": embeddings,

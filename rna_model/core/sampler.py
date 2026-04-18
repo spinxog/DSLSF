@@ -108,8 +108,18 @@ class RNASampler(nn.Module):
     def generate_decoys(self, sequence: str, embeddings: torch.Tensor, 
                      initial_coords: Optional[torch.Tensor] = None,
                      return_all_decoys: bool = False,
-                     progress_callback: Optional[Callable[[int, int], None]] = None) -> Tuple[List[Dict], PerformanceMetrics]:
-        """Generate structure decoys with performance metrics."""
+                     progress_callback: Optional[Callable[[int, int], None]] = None,
+                     temperatures: Optional[List[float]] = None) -> Tuple[List[Dict], PerformanceMetrics]:
+        """Generate structure decoys with performance metrics.
+        
+        Args:
+            sequence: RNA sequence string
+            embeddings: Sequence embeddings from language model
+            initial_coords: Optional initial coordinates
+            return_all_decoys: Whether to return all decoys or just best
+            progress_callback: Optional callback for progress updates
+            temperatures: Optional list of temperatures for diverse sampling (one per decoy)
+        """
         # Input validation
         if not sequence or not isinstance(sequence, str):
             raise ValueError("Sequence must be a non-empty string")
@@ -167,14 +177,22 @@ class RNASampler(nn.Module):
         
         n_decoys_to_generate = self.config.n_decoys if return_all_decoys else 1
         
+        # Validate temperatures if provided
+        if temperatures is not None:
+            if len(temperatures) != n_decoys_to_generate:
+                raise ValueError(f"temperatures length ({len(temperatures)}) must match n_decoys ({n_decoys_to_generate})")
+        else:
+            # Use default temperature for all
+            temperatures = [self.config.temperature] * n_decoys_to_generate
+        
         for i in range(n_decoys_to_generate):
             if progress_callback is not None:
                 progress_callback(i, n_decoys_to_generate)
             
-            # Sample structure
+            # Sample structure with diverse temperature
             sample_start = time.time()
             coords = self._sample_structure(
-                sequence, embeddings, initial_coords, temperature=self.config.temperature
+                sequence, embeddings, initial_coords, temperature=temperatures[i]
             )
             sample_time = time.time() - sample_start
             

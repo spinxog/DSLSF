@@ -17,10 +17,10 @@ from .constants import BIOLOGICAL, GEOMETRY, COMPUTATIONAL, MODEL
 @dataclass
 class GeometryConfig:
     """Configuration for geometry module."""
-    d_model: int = 256
+    d_model: int = 512  # Scaled up from 256 for better coordinate refinement
     n_heads: int = 8
-    n_layers: int = 4
-    d_ff: int = 1024
+    n_layers: int = 8   # Increased from 4 for more refinement iterations
+    d_ff: int = 2048    # Scaled up to match d_model
     dropout: float = 0.1
     n_atoms_per_residue: int = BIOLOGICAL.N_ATOMS_PER_RESIDUE
     distance_bins: int = MODEL.DEFAULT_DISTANCE_BINS
