@@ -118,8 +118,7 @@ tm_score = compute_tm_score(aligned_coords1, aligned_coords2)
 - **Geometry Module**: 512d, 8 layers (scaled up for better refinement)
 - **Total Parameters**: ~51M
 
-### Competition Support
-- Kaggle notebook ready for Stanford RNA 3D Folding Challenge
+### Competition
 - 8-hour inference limit compliant
 - Best-of-5 TM-score predictions with diverse sampling
 
@@ -177,7 +176,7 @@ If you use this software in your research, please cite:
 @software{DSLSF,
   title={Deep Learning Structure Folding},
   author={Pradip Debnath},
-  year={2024},
+  year={2025},
   url={https://github.com/spinxog/DSLSF}
 }
 ```
